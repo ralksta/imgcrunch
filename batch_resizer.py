@@ -496,30 +496,44 @@ def main():
         args = argparse.Namespace(**wizard_result)
     else:
         parser = argparse.ArgumentParser(
-            description='Batch convert and resize images.',
+            prog='imgcrunch',
+            description='ImgCrunch — Fast parallel image cruncher with format conversion.',
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
+            epilog="""\
+Output modes:
+  By default, converted files go to <input>/converted/ and originals
+  are moved to <input>/originals/. Use --replace to overwrite originals
+  in-place (destructive, no backup). Use --no-move to leave originals
+  where they are.
+
 Examples:
-  python batch_resizer.py /path/to/images
-  python batch_resizer.py /path/to/images --format heic
-  python batch_resizer.py /path/to/images --format avif --quality 80
-  python batch_resizer.py /path/to/images -o /path/to/output --max-size 2000
+  imgcrunch /path/to/images                          # defaults: JPEG, 3000px
+  imgcrunch /path/to/images -f heic -q 80            # convert to HEIC, quality 80
+  imgcrunch /path/to/images -f avif --max-size 2000   # AVIF, cap at 2000px
+  imgcrunch /path/to/images --max-size 0              # convert only, no resizing
+  imgcrunch /path/to/images --replace -f jpeg         # replace originals in-place
+  imgcrunch /path/to/images --rename vacation         # rename: vacation_001.jpg, ...
+  imgcrunch --wizard /path/to/images                  # interactive wizard with folder pre-filled
             """
         )
-        parser.add_argument('input_folder', help='Input folder containing images')
-        parser.add_argument('-o', '--output', help=f'Output folder (default: <input>/{OUTPUT_FOLDER_NAME})')
+        parser.add_argument('input_folder',
+                            help='Path to the folder containing images to process')
         parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif'], default='jpeg',
                             help='Output format (default: jpeg)')
         parser.add_argument('-q', '--quality', type=int, default=DEFAULT_QUALITY,
-                            help=f'Quality 1-100 (default: {DEFAULT_QUALITY})')
+                            help=f'Compression quality 1-100, higher = better (default: {DEFAULT_QUALITY})')
         parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
-                            help=f'Max longest side in px, larger images get resized (default: {DEFAULT_MAX_SIZE})')
-        parser.add_argument('--no-move', action='store_true',
-                            help='Do not move originals to "originals" folder')
+                            help=f'Max longest side in px; images larger than this get '
+                                 f'downscaled. Use 0 to skip resizing (default: {DEFAULT_MAX_SIZE})')
+        parser.add_argument('-o', '--output',
+                            help=f'Custom output folder (default: <input>/{OUTPUT_FOLDER_NAME})')
         parser.add_argument('--replace', action='store_true',
-                            help='Replace originals in-place (destructive)')
+                            help='Replace originals in-place (⚠️  destructive, no backup)')
+        parser.add_argument('--no-move', action='store_true',
+                            help='Keep originals in place (don\'t move to originals/ folder)')
         parser.add_argument('--rename', type=str, default=None, metavar='NAME',
-                            help='Rename output files with NAME_001, NAME_002, ... scheme')
+                            help='Rename output files as NAME_001, NAME_002, ... '
+                                 '(not available with --replace)')
 
         args = parser.parse_args()
 
