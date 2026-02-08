@@ -18,6 +18,9 @@ venv/
 .vscode/
 .idea/
 
+# Dev docs (internal notes)
+dev-docs/
+
 # Output folders (created by the resizer)
 converted/
 originals/

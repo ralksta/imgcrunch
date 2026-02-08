@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PIL import Image
@@ -104,13 +104,21 @@ def detect_dominant_format(images: list[Path]) -> str:
     return 'jpeg'
 
 
-def find_images(input_dir: Path) -> list[Path]:
-    """Recursively find all supported image files."""
+def find_images(input_dir: Path) -> list[tuple[Path, int]]:
+    """Recursively find all supported image files. Returns (path, size_bytes) tuples."""
     images = []
-    for ext in SUPPORTED_EXTENSIONS:
-        images.extend(input_dir.rglob(f'*{ext}'))
-        images.extend(input_dir.rglob(f'*{ext.upper()}'))
-    return sorted(set(images))
+    for dirpath, _, filenames in os.walk(input_dir):
+        for f in filenames:
+            if f.startswith('._'):
+                continue  # Skip macOS resource fork files
+            if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS:
+                full = Path(dirpath) / f
+                try:
+                    size = full.stat().st_size
+                except OSError:
+                    continue
+                images.append((full, size))
+    return sorted(images, key=lambda x: x[0])
 
 
 # ── Startup Wizard ───────────────────────────────────────────────────────────
@@ -154,7 +162,8 @@ def startup_wizard(prefill_folder: str | None = None) -> dict | None:
 
     # Scan folder to auto-detect format
     print(f"  {C.DIM}Scanning folder...{C.RESET}", end='', flush=True)
-    scanned_images = find_images(folder_path)
+    scanned_images_with_sizes = find_images(folder_path)
+    scanned_images = [p for p, _ in scanned_images_with_sizes]
     detected_format = detect_dominant_format(scanned_images)
     print(f"\r  {C.DIM}Found {len(scanned_images)} images{C.RESET}          ")
     print()
@@ -334,33 +343,55 @@ def calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]:
 
 
 def process_image(input_path: Path, output_path: Path, format_key: str, quality: int,
-                  max_size: int) -> dict:
+                  max_size: int, input_bytes: int = 0) -> dict:
     """Process a single image: convert and optionally resize. Preserves metadata."""
     result = {
         'input': str(input_path),
         'output': str(output_path),
         'resized': False,
+        'skipped': False,
         'original_size': None,
         'new_size': None,
-        'input_bytes': 0,
+        'input_bytes': input_bytes,
         'output_bytes': 0,
         'error': None
     }
 
     fmt = FORMAT_CONFIG[format_key]
+    use_piexif = format_key == 'jpeg'  # Only need piexif round-trip for JPEG output
 
     try:
-        result['input_bytes'] = input_path.stat().st_size
+        if not input_bytes:
+            result['input_bytes'] = input_path.stat().st_size
 
         with Image.open(input_path) as img:
+            width, height = img.size
+            result['original_size'] = (width, height)
+
+            # Early bail-out: skip if already target format and no resize needed
+            input_ext = input_path.suffix.lower()
+            target_ext = fmt['extension']
+            already_target_fmt = input_ext == target_ext or \
+                (input_ext in ('.jpg', '.jpeg') and target_ext in ('.jpg', '.jpeg'))
+            if already_target_fmt and not needs_resize(width, height, max_size) \
+                    and img.mode in ('RGB', 'L'):
+                result['skipped'] = True
+                result['new_size'] = (width, height)
+                result['output_bytes'] = result['input_bytes']
+                return result
+
             # Extract EXIF data if present
             exif_bytes = None
             exif_dict = None
             try:
                 if 'exif' in img.info:
-                    exif_dict = piexif.load(img.info['exif'])
-                    exif_bytes = img.info['exif']
-                elif input_path.suffix.lower() in ('.jpg', '.jpeg', '.tiff', '.tif'):
+                    raw_exif = img.info['exif']
+                    if use_piexif:
+                        exif_dict = piexif.load(raw_exif)
+                        exif_bytes = raw_exif
+                    else:
+                        exif_bytes = raw_exif  # Pass through raw bytes for HEIC/AVIF
+                elif use_piexif and input_path.suffix.lower() in ('.jpg', '.jpeg', '.tiff', '.tif'):
                     exif_dict = piexif.load(str(input_path))
                     exif_bytes = piexif.dump(exif_dict)
             except Exception:
@@ -376,9 +407,6 @@ def process_image(input_path: Path, output_path: Path, format_key: str, quality:
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
 
-            width, height = img.size
-            result['original_size'] = (width, height)
-
             # Check if resize is needed
             if needs_resize(width, height, max_size):
                 new_width, new_height = calculate_new_size(width, height, max_size)
@@ -386,8 +414,8 @@ def process_image(input_path: Path, output_path: Path, format_key: str, quality:
                 result['resized'] = True
                 result['new_size'] = (new_width, new_height)
 
-                # Update EXIF dimensions if present
-                if exif_dict:
+                # Update EXIF dimensions if present (only via piexif for JPEG)
+                if exif_dict and use_piexif:
                     try:
                         if piexif.ExifIFD.PixelXDimension in exif_dict.get('Exif', {}):
                             exif_dict['Exif'][piexif.ExifIFD.PixelXDimension] = new_width
@@ -445,6 +473,9 @@ def print_summary(stats: dict, elapsed: float):
     print(f"  {C.BOLD}Images resized:{C.RESET}    {C.CYAN}{resized}{C.RESET}")
     if errors > 0:
         print(f"  {C.BOLD}Errors:{C.RESET}            {C.RED}{errors}{C.RESET}")
+    skipped = stats.get('skipped', 0)
+    if skipped > 0:
+        print(f"  {C.BOLD}Skipped (no-op):{C.RESET}   {C.DIM}{skipped}{C.RESET}")
     if moved > 0:
         print(f"  {C.BOLD}Originals moved:{C.RESET}   {moved}")
     replaced = stats.get('replaced', 0)
@@ -585,12 +616,14 @@ Examples:
     print(f"{C.DIM}{'─' * 60}{C.RESET}")
 
     # Find all images (exclude output and originals folders)
-    all_images = find_images(input_dir)
+    all_images_with_sizes = find_images(input_dir)
     exclude_dirs = [str(output_dir)]
     if originals_dir:
         exclude_dirs.append(str(originals_dir))
-    images = [img for img in all_images
-              if not any(str(img).startswith(d) for d in exclude_dirs)]
+    images_with_sizes = [(img, sz) for img, sz in all_images_with_sizes
+                         if not any(str(img).startswith(d) for d in exclude_dirs)]
+    images = [img for img, _ in images_with_sizes]
+    image_sizes = {str(img): sz for img, sz in images_with_sizes}
 
     if not images:
         print(f"{C.YELLOW}No images found!{C.RESET}")
@@ -615,7 +648,8 @@ Examples:
         )
         if output_path.resolve() == img_path.resolve():
             continue
-        tasks.append((img_path, output_path))
+        file_size = image_sizes.get(str(img_path), 0)
+        tasks.append((img_path, output_path, file_size))
 
     start_time = time.time()
 
@@ -631,13 +665,13 @@ Examples:
     else:
         progress = None
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all tasks
         future_to_path = {}
-        for img_path, output_path in tasks:
+        for img_path, output_path, file_size in tasks:
             future = executor.submit(
                 process_image, img_path, output_path,
-                args.format, args.quality, args.max_size,
+                args.format, args.quality, args.max_size, file_size,
             )
             future_to_path[future] = img_path
 
@@ -653,6 +687,12 @@ Examples:
                 else:
                     print(msg)
                 stats['errors'] += 1
+            elif result.get('skipped'):
+                # No-op: already target format and size — skip silently
+                stats['processed'] += 1
+                stats['total_input_bytes'] += result['input_bytes']
+                stats['total_output_bytes'] += result['output_bytes']
+                stats['skipped'] = stats.get('skipped', 0) + 1
             else:
                 stats['processed'] += 1
                 stats['total_input_bytes'] += result['input_bytes']
@@ -663,14 +703,13 @@ Examples:
                     orig = result['original_size']
                     new = result['new_size']
                     msg = f"  {C.GREEN}✓{C.RESET} {C.DIM}Resized{C.RESET} {img_path.name} {C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
-                else:
-                    msg = f"  {C.GREEN}✓{C.RESET} {img_path.name}"
+                    if progress:
+                        tqdm.write(msg)
+                    else:
+                        print(msg)
 
                 if progress:
                     progress.set_postfix_str(img_path.name[-30:], refresh=False)
-                    tqdm.write(msg)
-                else:
-                    print(msg)
 
                 if replace_mode:
                     # Replace original: move converted file to original location
