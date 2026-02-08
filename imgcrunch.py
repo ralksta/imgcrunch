@@ -223,14 +223,13 @@ def startup_wizard(prefill_folder: str | None = None) -> dict | None:
     # --- 4. Max longest side ---
     print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
     print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
-    print(f"  {C.DIM}Enter 0 to skip resizing (convert only).{C.RESET}")
-    print(f"  {C.DIM}(press Enter for default: {DEFAULT_MAX_SIZE}px){C.RESET}")
+    print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
     print()
 
     while True:
-        size_input = input(f"  Max longest side [{C.CYAN}{DEFAULT_MAX_SIZE}{C.RESET}]: ").strip()
+        size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
         if not size_input:
-            target_size = DEFAULT_MAX_SIZE
+            target_size = 0
             break
         try:
             target_size = int(size_input)

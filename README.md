@@ -7,12 +7,14 @@ A fast, parallel image cruncher with format conversion. Processes entire folders
 - **Multi-format output** — JPEG, HEIC, or AVIF
 - **Smart resize** — only downsizes images exceeding a configurable max dimension (or skip with `0`)
 - **Two output modes** — keep originals safe, or replace them in-place
-- **Parallel processing** — uses all available CPU cores with progress bar
+- **Parallel processing** — threaded processing with progress bar
 - **EXIF preservation** — metadata is carried over to converted files
-- **Interactive wizard** — zero-config start, just run and answer prompts
+- **Interactive wizard** — zero-config start, just run and answer prompts (defaults to convert-only)
 - **CLI mode** — full flag support for scripting and automation
 - **Batch rename** — optional clean naming scheme (`vacation_001.jpg`, `vacation_002.jpg`, …)
+- **Smart skipping** — automatically skips images already in the target format and size
 - **macOS Finder integration** — right-click a folder to launch (see below)
+- **macOS safe** — ignores `._` resource fork files
 
 ## 🚀 Quick Start
 
