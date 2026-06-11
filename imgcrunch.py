@@ -566,7 +566,10 @@ def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
     print()
     confirm = input(f"  Start processing? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
     if confirm and confirm not in ('y', 'yes'):
-        print(f"\n  {C.YELLOW}Aborted.{C.RESET}")
+        print()
+        print(f"  {C.DIM}No worries — nothing was changed.{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
+        print()
         return None
 
     return {
@@ -955,4 +958,11 @@ Examples:
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print(f"  {C.DIM}Cancelled — nothing was changed.{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
+        print()
+        sys.exit(0)
