@@ -4,9 +4,9 @@ A fast, parallel image cruncher with format conversion. Processes entire folders
 
 ## ✨ Features
 
-- **Multi-format output** — JPEG, HEIC, AVIF, or WebP
+- **Multi-format output** — JPEG, HEIC, AVIF, WebP, or JPEG XL (JXL)
 - **Smart resize** — only downsizes images exceeding a configurable max dimension (or skip with `0`)
-- **Smart quality defaults** — tuned per format (JPEG 85 · HEIC 65 · AVIF 60 · WebP 82)
+- **Smart quality defaults** — tuned per format (JPEG 85 · HEIC 65 · AVIF 60 · WebP 82 · JXL 85)
 - **Lossless mode** — `--lossless` flag for AVIF and WebP
 - **Two output modes** — keep originals safe, or replace them in-place
 - **ProcessPool parallelism** — CPU-bound encode/resize runs in a process pool for true multi-core throughput
@@ -18,7 +18,10 @@ A fast, parallel image cruncher with format conversion. Processes entire folders
 - **Post-process hook** — `--post-hook 'cmd {in} {out}'` runs a shell command after each file
 - **Throughput stats** — summary shows img/s and MB/s input throughput
 - **Per-format summary** — breakdown of how many files were processed per source format
-- **EXIF preservation** — metadata is carried over to converted files
+- **EXIF preservation** — metadata is carried over to converted files (or strip for privacy)
+- **Privacy mode** — `--strip` / `--no-exif` flag to completely remove EXIF metadata from output images
+- **Animated image support** — converts animated GIFs to WebP/AVIF while preserving frame-specific durations
+- **Terminal title progress** — updates the terminal window title with the progress percentage
 - **Interactive wizard** — zero-config start, just run and answer prompts (defaults to convert-only, no resize)
 - **CLI mode** — full flag support for scripting and automation
 - **Batch rename** — optional clean naming scheme (`vacation_001.jpg`, `vacation_002.jpg`, …)
@@ -79,7 +82,7 @@ A single Terminal window opens with the interactive wizard for all selected item
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-f`, `--format` | Output format: `jpeg`, `heic`, `avif`, `webp`, `original` (copy-only) | `jpeg` |
+| `-f`, `--format` | Output format: `jpeg`, `heic`, `avif`, `webp`, `jxl`, `original` (copy-only) | `jpeg` |
 | `-q`, `--quality` | Quality 1–100 | smart per-format default |
 | `-m`, `--max-size` | Max longest side in pixels (`0` = no resize) | `0` |
 | `-o`, `--output` | Custom output folder | first `<input>/converted` |
@@ -87,6 +90,7 @@ A single Terminal window opens with the interactive wizard for all selected item
 | `--rename NAME` | Rename files as `NAME_001`, `NAME_002`, … | keep originals |
 | `--no-move` | Don't move originals to `originals/` folder | move by default |
 | `--lossless` | Lossless encoding (AVIF and WebP only) | off |
+| `--strip` | Strip EXIF metadata from output images (Privacy Mode) | off |
 | `--post-hook CMD` | Shell command to run after each file (`{in}`, `{out}` placeholders) | none |
 | `--merge` | Merge all input folders/files into a single output folder | off |
 
@@ -118,16 +122,22 @@ your-folder/
 - [Pillow](https://pillow.readthedocs.io/) ≥ 10.0
 - [piexif](https://pypi.org/project/piexif/) ≥ 1.1.3
 - [pillow-heif](https://pypi.org/project/pillow-heif/) ≥ 0.16.0 (for HEIC/AVIF support)
+- [pillow-jxl-plugin](https://pypi.org/project/pillow-jxl-plugin/) ≥ 0.1.0 (optional, for JPEG XL support)
 - [tqdm](https://pypi.org/project/tqdm/) ≥ 4.60.0 (progress bar)
 
 ## 📅 Changelog
 
 ### 2026-07-05
+- **JPEG XL support** — next-gen `.jxl` support (requires `pillow-jxl-plugin`)
+- **Privacy mode** — `--strip` / `--no-exif` flag to completely remove EXIF metadata
+- **Animation timing preservation** — converts animated GIFs to WebP/AVIF while preserving variable frame durations
+- **Terminal title updates** — updates the terminal window title with the progress percentage
 - **Multi-input support** — pass multiple folders and files as arguments
 - **Merge mode** — merge multiple source directories and files into a destination folder
 - **Copy-only (no recompression) mode** — `-f original` allows merging and renaming without modifying the image binary
 - **macOS Finder Quick Action upgrade** — works on files and multiple items in a single terminal session, with robust temp-file argument escaping for spaces/special characters
 - **Automatic collision resolver** — suffix counters (like `_1.jpg`) avoid overwriting files when merging duplicate names
+- **Wizard and Scan Bugfixes** — fixed directory exclusion logic for single file inputs, corrected format detection fallback-marker logic, and mapped GIF format to WebP by default in the wizard.
 
 ### 2026-06-11
 - **ProcessPool parallelism** — encode/resize now runs across all CPU cores via `ProcessPoolExecutor`

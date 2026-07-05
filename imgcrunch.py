@@ -36,6 +36,13 @@ try:
 except ImportError:
     HEIF_AVAILABLE = False
 
+# Try to import JXL support
+try:
+    import pillow_jxl
+    JXL_AVAILABLE = True
+except ImportError:
+    JXL_AVAILABLE = False
+
 # Try to import tqdm
 try:
     from tqdm import tqdm
@@ -72,25 +79,27 @@ FORMAT_QUALITY_DEFAULTS = {
     'heic': 65,
     'avif': 60,
     'webp': 82,
+    'jxl': 85,
 }
 
 SUPPORTED_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif',
-    '.webp', '.gif', '.heic', '.heif', '.avif',
+    '.webp', '.gif', '.heic', '.heif', '.avif', '.jxl',
 }
 
 EXT_TO_FORMAT = {
     '.jpg': 'jpeg', '.jpeg': 'jpeg', '.png': 'jpeg', '.bmp': 'jpeg',
-    '.tiff': 'jpeg', '.tif': 'jpeg', '.webp': 'webp', '.gif': 'jpeg',
+    '.tiff': 'jpeg', '.tif': 'jpeg', '.webp': 'webp', '.gif': 'webp',
     '.heic': 'heic', '.heif': 'heic',
-    '.avif': 'avif',
+    '.avif': 'avif', '.jxl': 'jxl',
 }
 
 FORMAT_CONFIG = {
     'jpeg': {'extension': '.jpg',  'pillow_format': 'JPEG', 'extra_opts': {'optimize': True, 'progressive': True}},
     'heic': {'extension': '.heic', 'pillow_format': 'HEIF', 'extra_opts': {}},
     'avif': {'extension': '.avif', 'pillow_format': 'AVIF', 'extra_opts': {}},
-    'webp': {'extension': '.webp', 'pillow_format': 'WEBP', 'extra_opts': {'method': 6}},
+    'webp': {'extension': '.webp', 'pillow_format': 'WEBP', 'extra_opts': {'method': 4}},
+    'jxl':  {'extension': '.jxl',  'pillow_format': 'JXL',  'extra_opts': {}},
 }
 
 IS_MACOS = sys.platform == 'darwin'
@@ -213,7 +222,10 @@ def find_images_from_paths(paths: list[Path]) -> list[tuple[Path, int]]:
 
 def disk_free_bytes(path: Path) -> int:
     """Return free disk bytes on the volume containing path."""
-    stat = shutil.disk_usage(path)
+    curr = path
+    while not curr.exists() and curr.parent != curr:
+        curr = curr.parent
+    stat = shutil.disk_usage(curr)
     return stat.free
 
 
@@ -272,6 +284,13 @@ def refresh_quicklook(paths: list[Path]) -> None:
         pass
 
 
+def set_terminal_title(title: str) -> None:
+    """Set the terminal window title if running in a TTY."""
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\x1b]2;{title}\x07")
+        sys.stdout.flush()
+
+
 def get_input_root(img_path: Path, input_folders: list[Path]) -> Path:
     """Find which input folder contains the given image path."""
     for folder in input_folders:
@@ -292,11 +311,18 @@ def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Pat
         new_name = f"{rename_base}_{str(rename_index).zfill(pad_width)}{ext}"
         output_path = output_dir / new_name
     else:
-        if merge_mode or input_root is None:
+        if merge_mode or input_root is None or input_root.is_file():
             output_path = output_dir / input_path.name
+            if extension != 'original':
+                output_path = output_path.with_suffix(ext)
         else:
             relative_path = input_path.relative_to(input_root)
-            output_path = output_dir / relative_path.with_suffix(ext)
+            if relative_path == Path('.'):
+                output_path = output_dir / input_path.name
+                if extension != 'original':
+                    output_path = output_path.with_suffix(ext)
+            else:
+                output_path = output_dir / relative_path.with_suffix(ext)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
 
@@ -330,6 +356,7 @@ def process_image(
     max_size:    int,
     input_bytes: int = 0,
     lossless:    bool = False,
+    strip_exif:  bool = False,
 ) -> ProcessResult:
     """
     Process a single image: convert, optionally resize, verify output, atomic write.
@@ -351,7 +378,32 @@ def process_image(
         try:
             if not result.input_bytes:
                 result.input_bytes = input_path.stat().st_size
-            shutil.copy2(input_path, tmp_path)
+            
+            if strip_exif:
+                # Load and save without metadata
+                with Image.open(input_path) as img:
+                    is_animated = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
+                    if is_animated:
+                        from PIL import ImageSequence
+                        frames = []
+                        durations = []
+                        for f in ImageSequence.Iterator(img):
+                            frames.append(f.copy())
+                            durations.append(f.info.get('duration', 100))
+                        frames[0].save(
+                            tmp_path,
+                            img.format,
+                            save_all=True,
+                            append_images=frames[1:],
+                            duration=durations,
+                            loop=img.info.get('loop', 0)
+                        )
+                    else:
+                        img.save(tmp_path, img.format)
+            else:
+                # Fast standard copy
+                shutil.copy2(input_path, tmp_path)
+            
             tmp_path.replace(output_path)
             result.output_bytes = output_path.stat().st_size
         except Exception as e:
@@ -366,96 +418,134 @@ def process_image(
         if not result.input_bytes:
             result.input_bytes = input_path.stat().st_size
 
-        # Use mmap for the read if file is large enough (#3)
-        # PIL needs a real file-like object; we open normally but mmap is used
-        # internally by the OS page cache — just ensure we open in binary mode.
         with Image.open(input_path) as img:
             width, height = img.size
             result.original_size = (width, height)
 
-            # Early bail-out: already target format, no resize, no mode conversion needed
+            # Early bail-out: already target format, no resize, no mode conversion needed, and no strip
             target_ext = fmt['extension']
             already_target = (
                 input_ext == target_ext
                 or (input_ext in ('.jpg', '.jpeg') and target_ext == '.jpg')
             )
+            is_animated_gif = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
             if already_target and not needs_resize(width, height, max_size) \
-                    and img.mode in ('RGB', 'L') and not lossless:
+                    and img.mode in ('RGB', 'L') and not lossless and not strip_exif and not is_animated_gif:
                 result.skipped     = True
                 result.new_size    = (width, height)
                 result.output_bytes = result.input_bytes
                 return result
 
-            # Extract EXIF
+            # Extract EXIF (if not stripping)
             exif_bytes = None
             exif_dict  = None
-            try:
-                if 'exif' in img.info:
-                    raw_exif = img.info['exif']
-                    if use_piexif:
-                        exif_dict  = piexif.load(raw_exif)
-                        exif_bytes = raw_exif
-                    else:
-                        exif_bytes = raw_exif
-                elif use_piexif and input_ext in ('.jpg', '.jpeg', '.tiff', '.tif'):
-                    exif_dict  = piexif.load(str(input_path))
-                    exif_bytes = piexif.dump(exif_dict)
-            except Exception:
-                exif_dict = None
-
-            # Mode conversion
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
-
-            # Resize
-            if needs_resize(width, height, max_size):
-                new_width, new_height = calculate_new_size(width, height, max_size)
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                result.resized  = True
-                result.new_size = (new_width, new_height)
-                if exif_dict and use_piexif:
-                    try:
-                        if piexif.ExifIFD.PixelXDimension in exif_dict.get('Exif', {}):
-                            exif_dict['Exif'][piexif.ExifIFD.PixelXDimension] = new_width
-                        if piexif.ExifIFD.PixelYDimension in exif_dict.get('Exif', {}):
-                            exif_dict['Exif'][piexif.ExifIFD.PixelYDimension] = new_height
+            if not strip_exif:
+                try:
+                    if 'exif' in img.info:
+                        raw_exif = img.info['exif']
+                        if use_piexif:
+                            exif_dict  = piexif.load(raw_exif)
+                            exif_bytes = raw_exif
+                        else:
+                            exif_bytes = raw_exif
+                    elif use_piexif and input_ext in ('.jpg', '.jpeg', '.tiff', '.tif'):
+                        exif_dict  = piexif.load(str(input_path))
                         exif_bytes = piexif.dump(exif_dict)
-                    except Exception:
-                        pass
+                except Exception:
+                    exif_dict = None
+
+            # Handle Animation (GIF/etc -> WebP/AVIF)
+            is_animated = is_animated_gif and format_key in ('webp', 'avif')
+            if is_animated:
+                from PIL import ImageSequence
+                frames = []
+                durations = []
+                for frame in ImageSequence.Iterator(img):
+                    if needs_resize(width, height, max_size):
+                        new_width, new_height = calculate_new_size(width, height, max_size)
+                        resized_frame = frame.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        result.resized  = True
+                        result.new_size = (new_width, new_height)
+                    else:
+                        resized_frame = frame.copy()
+                    
+                    # Convert to RGBA to keep transparency
+                    frames.append(resized_frame.convert('RGBA'))
+                    durations.append(frame.info.get('duration', 100))
+
+                # Build save kwargs
+                save_kwargs = {**fmt['extra_opts']}
+                if lossless and format_key in ('avif', 'webp'):
+                    save_kwargs['lossless'] = True
+                else:
+                    save_kwargs['quality'] = quality
+                
+                # Animation options
+                save_kwargs['save_all'] = True
+                save_kwargs['append_images'] = frames[1:]
+                save_kwargs['duration'] = durations
+                save_kwargs['loop'] = img.info.get('loop', 0)
+                
+                tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+                try:
+                    frames[0].save(tmp_path, fmt['pillow_format'], **save_kwargs)
+                    with Image.open(tmp_path) as verify_img:
+                        verify_img.verify()
+                    tmp_path.replace(output_path)
+                except Exception as e:
+                    tmp_path.unlink(missing_ok=True)
+                    raise e
             else:
-                result.new_size = (width, height)
+                # Handle Static Image
+                # Mode conversion
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
 
-            # Build save kwargs
-            save_kwargs: dict = {**fmt['extra_opts']}
-            if lossless and format_key in ('avif', 'webp'):
-                save_kwargs['lossless'] = True
-            else:
-                save_kwargs['quality'] = quality
-            if exif_bytes:
-                save_kwargs['exif'] = exif_bytes
+                # Resize
+                if needs_resize(width, height, max_size):
+                    new_width, new_height = calculate_new_size(width, height, max_size)
+                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    result.resized  = True
+                    result.new_size = (new_width, new_height)
+                    if exif_dict and use_piexif:
+                        try:
+                            if piexif.ExifIFD.PixelXDimension in exif_dict.get('Exif', {}):
+                                exif_dict['Exif'][piexif.ExifIFD.PixelXDimension] = new_width
+                            if piexif.ExifIFD.PixelYDimension in exif_dict.get('Exif', {}):
+                                exif_dict['Exif'][piexif.ExifIFD.PixelYDimension] = new_height
+                            exif_bytes = piexif.dump(exif_dict)
+                        except Exception:
+                            pass
+                else:
+                    result.new_size = (width, height)
 
-            # Atomic write: save to .tmp sibling, then rename (#12 approach)
-            tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
-            try:
-                img.save(tmp_path, fmt['pillow_format'], **save_kwargs)
+                # Build save kwargs
+                save_kwargs = {**fmt['extra_opts']}
+                if lossless and format_key in ('avif', 'webp'):
+                    save_kwargs['lossless'] = True
+                else:
+                    save_kwargs['quality'] = quality
+                if exif_bytes:
+                    save_kwargs['exif'] = exif_bytes
 
-                # Verify the output is a valid image (#11)
-                with Image.open(tmp_path) as verify_img:
-                    verify_img.verify()
+                # Atomic write
+                tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+                try:
+                    img.save(tmp_path, fmt['pillow_format'], **save_kwargs)
+                    with Image.open(tmp_path) as verify_img:
+                        verify_img.verify()
+                    tmp_path.replace(output_path)
+                except Exception as e:
+                    tmp_path.unlink(missing_ok=True)
+                    raise e
 
-                # Commit
-                tmp_path.replace(output_path)
-            except Exception as e:
-                tmp_path.unlink(missing_ok=True)
-                raise e
-
-        result.output_bytes = output_path.stat().st_size
+            result.output_bytes = output_path.stat().st_size
 
     except Exception as e:
         result.error = str(e)
@@ -576,25 +666,27 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
 
     # 3. Format (if not copy-only)
     if 'format_key' not in locals():
-        format_keys    = ['jpeg', 'heic', 'avif', 'webp']
-        detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else '1'
+        format_keys    = ['jpeg', 'heic', 'avif', 'webp', 'jxl']
+        detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else None
+        default_index  = detected_index or '1'
         format_options = {
             '1': ('jpeg', 'JPEG  (.jpg)  — universal, great compression'),
             '2': ('heic', 'HEIC  (.heic) — Apple ecosystem, smaller files'),
             '3': ('avif', 'AVIF  (.avif) — next-gen, best compression'),
             '4': ('webp', 'WebP  (.webp) — web-optimised, wide support'),
+            '5': ('jxl',  'JPEG XL (.jxl) — next-gen, high fidelity, Apple native'),
         }
         print(f"  {C.BOLD}Which output format would you like?{C.RESET}")
         print()
         for key, (_, label) in format_options.items():
-            marker = f" {C.GREEN}← detected{C.RESET}" if key == detected_index else ""
+            marker = f" {C.GREEN}← detected{C.RESET}" if detected_index and key == detected_index else ""
             print(f"    [{C.CYAN}{key}{C.RESET}]  {label}{marker}")
         print()
         while True:
-            choice = input(f"  Your choice (1/2/3/4) [{C.CYAN}{detected_index}{C.RESET}]: ").strip() or detected_index
+            choice = input(f"  Your choice (1/2/3/4/5) [{C.CYAN}{default_index}{C.RESET}]: ").strip() or default_index
             if choice in format_options:
                 break
-            print(f"  {C.YELLOW}⚠️  Please enter 1–4.{C.RESET}")
+            print(f"  {C.YELLOW}⚠️  Please enter 1–5.{C.RESET}")
 
         format_key     = format_options[choice][0]
 
@@ -603,6 +695,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         if format_key in ('heic', 'avif') and not HEIF_AVAILABLE:
             print(f"\n  {C.RED}❌  {format_key.upper()} support requires pillow-heif.{C.RESET}")
             print(f"      Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
+            return None
+        if format_key == 'jxl' and not JXL_AVAILABLE:
+            print(f"\n  {C.RED}❌  JXL support requires pillow-jxl-plugin.{C.RESET}")
+            print(f"      Install with: {C.CYAN}pip install pillow-jxl-plugin{C.RESET}")
             return None
         print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
@@ -658,6 +754,18 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             rename_base = None
         print()
 
+    # 6. Privacy Mode (EXIF stripping)
+    print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
+    print(f"  {C.DIM}This removes GPS coordinates, camera model, etc.{C.RESET}")
+    print()
+    strip_input = input(f"  Strip metadata? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+    strip_mode = strip_input in ('y', 'yes')
+    if strip_mode:
+        print(f"  {C.GREEN}✅  Privacy Mode: EXIF metadata will be stripped{C.RESET}")
+    else:
+        print(f"  {C.GREEN}✅  EXIF metadata will be preserved{C.RESET}")
+    print()
+
     # Confirmation
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
     if merge_mode:
@@ -674,6 +782,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.BOLD}Folder:{C.RESET}       {input_paths[0]}")
     if not replace_mode:
         print(f"  {C.BOLD}Rename:{C.RESET}       {rename_base + '_###' if rename_base else C.DIM + 'keep originals' + C.RESET}")
+    print(f"  {C.BOLD}Privacy:{C.RESET}      {'⚠️  Strip metadata' if strip_mode else 'Keep EXIF metadata'}")
     print(f"  {C.BOLD}Images:{C.RESET}       {len(scanned_images)}")
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
 
@@ -703,6 +812,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'skip_dupes':    False,
         'post_hook':     None,
         'merge':         merge_mode,
+        'strip':         strip_mode,
     }
 
 
@@ -819,7 +929,7 @@ Output modes:
   (destructive). Use --no-move to leave originals where they are.
 
 Quality defaults (tuned per format):
-  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82
+  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82   JXL: 85
 
 Examples:
   imgcrunch /path/to/images                          # JPEG, smart quality, no resize
@@ -829,13 +939,14 @@ Examples:
   imgcrunch /path/to/images --skip-dupes             # skip content-identical files
   imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
   imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
+  imgcrunch /path/to/images --strip                  # remove EXIF metadata
   imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
   imgcrunch --wizard /path/to/images                 # interactive wizard
             """
         )
         parser.add_argument('input_folders', nargs='+',
                             help='Path to the folder(s) or file(s) containing images to process')
-        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'original'], default='jpeg',
+        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'jxl', 'original'], default='jpeg',
                             help='Output format (default: jpeg, or original to keep format)')
         parser.add_argument('-q', '--quality', type=int, default=None,
                             help='Compression quality 1–100 (default: smart per-format default)')
@@ -853,6 +964,8 @@ Examples:
                             help='Lossless encode (AVIF and WebP only)')
         parser.add_argument('--skip-dupes', action='store_true',
                             help='Skip files that are content-identical to an already-processed file')
+        parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
+                            help='Strip EXIF metadata from output images (Privacy Mode)')
         parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
                             help='Shell command to run after each file. '
                                  'Use {in} and {out} as placeholders.')
@@ -867,10 +980,14 @@ Examples:
             quality = FORMAT_QUALITY_DEFAULTS[args.format]
     args.quality = quality
 
-    # Check HEIC/AVIF availability
+    # Check HEIC/AVIF/JXL availability
     if args.format in ('heic', 'avif') and not HEIF_AVAILABLE:
         print(f"{C.RED}Error: {args.format.upper()} support requires pillow-heif{C.RESET}")
         print(f"Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
+        sys.exit(1)
+    if args.format == 'jxl' and not JXL_AVAILABLE:
+        print(f"{C.RED}Error: JXL support requires pillow-jxl-plugin{C.RESET}")
+        print(f"Install with: {C.CYAN}pip install pillow-jxl-plugin{C.RESET}")
         sys.exit(1)
 
     input_paths  = [Path(p).resolve() for p in args.input_folders]
@@ -878,6 +995,7 @@ Examples:
     merge_mode   = getattr(args, 'merge', False)
     lossless     = getattr(args, 'lossless', False)
     skip_dupes   = getattr(args, 'skip_dupes', False)
+    strip        = getattr(args, 'strip', False)
     post_hook    = getattr(args, 'post_hook', None)
     rename_base  = getattr(args, 'rename', None)
     fmt          = None if args.format == 'original' else FORMAT_CONFIG[args.format]
@@ -939,6 +1057,8 @@ Examples:
         print(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
     if skip_dupes:
         print(f"  {C.BOLD}Skip dupes:{C.RESET}      {C.CYAN}yes (content hash){C.RESET}")
+    if strip:
+        print(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
     if post_hook:
         print(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
     print(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
@@ -949,7 +1069,13 @@ Examples:
     # Find images
     all_images_with_sizes = find_images_from_paths(input_paths)
     images_with_sizes = []
+    explicit_files = {p.resolve() for p in input_paths if p.is_file()}
+
     for img, sz in all_images_with_sizes:
+        if img.resolve() in explicit_files:
+            images_with_sizes.append((img, sz))
+            continue
+
         root = get_input_root(img, input_paths)
         exclude_dirs = []
         if args.output:
@@ -1056,12 +1182,17 @@ Examples:
             future = executor.submit(
                 process_image,
                 str(img_path), str(output_path),
-                args.format, args.quality, args.max_size, file_size, lossless,
+                args.format, args.quality, args.max_size, file_size, lossless, strip,
             )
             future_to_path[future] = img_path
 
+        completed_tasks = 0
         for future in as_completed(future_to_path):
+            completed_tasks += 1
             img_path = future_to_path[future]
+            pct = int(completed_tasks / len(tasks) * 100)
+            set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
+            
             result: ProcessResult = future.result()
 
             if result.error:
@@ -1138,6 +1269,8 @@ Examples:
 
     if progress:
         progress.close()
+
+    set_terminal_title("[ImgCrunch] Done")
 
     if replace_mode:
         shutil.rmtree(tmp_dir, ignore_errors=True)
