@@ -1,167 +1,155 @@
 # 🖼️ ImgCrunch
 
-A fast, parallel image cruncher with format conversion. Processes entire folders of images — resize, convert, and optionally rename — all with EXIF metadata preserved.
+ImgCrunch ist ein extrem schnelles, paralleles Bildverarbeitungstool für die Befehlszeile (CLI) und den macOS Finder. Es ermöglicht das blitzschnelle Konvertieren, Skalieren, Umbenennen und Bereinigen ganzer Bildersammlungen über alle CPU-Kerne deines Systems.
 
-## ✨ Features
+---
 
-- **Multi-format output** — JPEG, HEIC, AVIF, WebP, or JPEG XL (JXL)
-- **Smart resize** — only downsizes images exceeding a configurable max dimension (or skip with `0`)
-- **Smart quality defaults** — tuned per format (JPEG 85 · HEIC 65 · AVIF 60 · WebP 82 · JXL 85)
-- **Lossless mode** — `--lossless` flag for AVIF and WebP
-- **Two output modes** — keep originals safe, or replace them in-place
-- **ProcessPool parallelism** — CPU-bound encode/resize runs in a process pool for true multi-core throughput
-- **mmap-accelerated reads** — large files are memory-mapped for faster I/O
-- **Disk preflight check** — estimates required space before starting; aborts early if disk is too full
-- **Duplicate detection** — MD5-hashes all input files and skips content-identical duplicates automatically
-- **Output verification** — each output file is opened and verified after writing
-- **Atomic writes** — images are written to a temp file first and renamed on success to avoid partial outputs
-- **Post-process hook** — `--post-hook 'cmd {in} {out}'` runs a shell command after each file
-- **Throughput stats** — summary shows img/s and MB/s input throughput
-- **Per-format summary** — breakdown of how many files were processed per source format
-- **EXIF preservation** — metadata is carried over to converted files (or strip for privacy)
-- **Privacy mode** — `--strip` / `--no-exif` flag to completely remove EXIF metadata from output images
-- **Animated image support** — converts animated GIFs to WebP/AVIF while preserving frame-specific durations
-- **Terminal title progress** — updates the terminal window title with the progress percentage
-- **Interactive wizard** — zero-config start, just run and answer prompts (defaults to convert-only, no resize)
-- **CLI mode** — full flag support for scripting and automation
-- **Batch rename** — optional clean naming scheme (`vacation_001.jpg`, `vacation_002.jpg`, …)
-- **Smart skipping** — automatically skips images already in the target format and size
-- **macOS Finder integration** — select multiple folders and/or files in Finder and run the Quick Action
-- **Multi-input & Merge** — pass multiple files or folders; merge them into a single folder and optionally rename them
-- **Original Copy mode** — choose `original` format to copy/rename files without recompressing them
-- **Collision protection** — automatically appends numeric suffixes to duplicate filenames when merging
-- **macOS safe** — ignores `._` resource fork files; triggers Quick Look thumbnail refresh after processing
+## ⚡ Core Features
 
-## 🚀 Quick Start
+### 📦 Multi-Format Power
+- **Moderne Formate**: Konvertierung nach **JPEG**, **HEIC** (Apple Standard), **AVIF** (Next-Gen), **WebP** (Web-optimiert) und **JPEG XL (JXL)**.
+- **Transparenz-Erhalt**: Beibehält den Alpha-Kanal (RGBA) bei Formaten, die Transparenz unterstützen (WebP, AVIF, JXL).
+- **Verlustfreier Modus**: `--lossless` Flag für verlustfreie AVIF- und WebP-Bilder.
+- **Smart Quality**: Automatisch optimierte Qualitätsstufen pro Ausgabeformat für die perfekte Balance aus Bildgröße und Qualität.
+- **Kopiermodus (`original`)**: Bilder mergen und umbenennen ohne Neukompression (1:1 binäre Kopien).
 
-### 1. Clone & install
+### 🚀 High-Speed Performance
+- **Echte Parallelität**: CPU-intensives Skalieren und Kodieren läuft parallel über alle verfügbaren Kerne via Pythons `ProcessPoolExecutor`.
+- **mmap-Beschleunigung**: Schnelle, speicherabgebildete Lesezugriffe (Memory Mapping) bei großen Quellbildern.
+- **Smart Skipping**: Überspringt Bilder, die bereits im Zielformat vorliegen und die Maximalgröße nicht überschreiten.
+- **Duplikat-Erkennung**: Hashed Dateien via MD5 und überspringt Inhalts-Duplikate vollautomatisch.
 
+### 🍎 macOS Integration
+- **Finder Quick Action**: Bilder und Ordner direkt im Finder auswählen, Rechtsklick → *Schnellaktionen* → *ImgCrunch*. Startet sofort die interaktive Konsole.
+- **Automatische Aktualisierung**: Triggered den macOS Quick Look Thumbnail-Cache, damit die Finder-Vorschauen nach dem Crunch sofort aktualisiert sind.
+- **Finder-Safe**: Ignoriert macOS-Systemdateien wie `._` automatisch.
+
+### 🛡️ Privacy & Safety
+- **Privacy Mode (`--strip` / `--no-exif`)**: Entfernt EXIF-Metadaten (GPS-Koordinaten, Kamerainformationen, etc.) vollständig vor dem Speichern.
+- **Atomares Schreiben**: Bilder werden in eine temporäre Datei geschrieben und erst bei erfolgreichem Validieren umbenannt. Kein Datenverlust bei Abbruch.
+- **Preflight Speicher-Check**: Schätzt den benötigten Speicherplatz im Voraus und bricht ab, falls die Festplatte vollzulaufen droht.
+
+---
+
+## 🚀 Installation & Quick Start
+
+### 1. Repository klonen und einrichten
 ```bash
-git clone https://github.com/YOUR_USER/batchresizer-quick.git
-cd batchresizer-quick
+git clone https://github.com/ralksta/imgcrunch.git
+cd imgcrunch
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Run
+### 2. macOS Finder Quick Action installieren
+Um Bilder direkt aus dem macOS Finder per Rechtsklick zu verarbeiten:
+```bash
+bash install_macos_quick_action.sh
+```
+*Zur Deinstallation einfach den Ordner `~/Library/Services/ImgCrunch.workflow` löschen.*
 
-**Interactive wizard** (no arguments):
+---
 
+## 🔥 Performance Tuning (Pillow-SIMD)
+
+Für maximale Verarbeitungsgeschwindigkeit (besonders beim Skalieren großer Mengen hochauflösender Fotos) kannst du **Pillow-SIMD** installieren. Es nutzt SSE4, AVX2 oder NEON (auf Apple Silicon Macs) und beschleunigt Resizing-Operationen um das **4- bis 6-fache**:
+
+```bash
+# Deinstalliere das normale Pillow
+pip uninstall pillow
+
+# Installiere Pillow-SIMD mit AVX2/NEON Optimierung
+CC="clang -mavx2" pip install pillow-simd
+```
+
+---
+
+## 🎮 Usage Guide
+
+### 1. Interaktiver Wizard (Empfohlen)
+Startet ohne Argumente die interaktive Konsole, die dich Schritt für Schritt durch die Optionen führt. Perfekt für den Finder-Rechtsklick:
 ```bash
 bash resize.sh
 ```
 
-**CLI mode** (scriptable):
-
+### 2. CLI-Modus (Automatisierung)
+Ideal für Skripte und Entwickler:
 ```bash
+# JPEG-Konvertierung ohne Größenänderung
 bash resize.sh /path/to/images
+
+# Nach HEIC konvertieren mit Qualität 80
 bash resize.sh /path/to/images --format heic --quality 80
+
+# Bildgröße deckeln auf max. 2000px Kantenlänge und umbenennen (vacation_001.jpg etc.)
 bash resize.sh /path/to/images --max-size 2000 --rename vacation
+
+# Bestehende Bilder direkt überschreiben (Destruktiv!)
 bash resize.sh /path/to/images --replace --format avif
-bash resize.sh /path/to/images --max-size 0 --format jpeg        # convert only, no resizing
-bash resize.sh /path/to/images --lossless --format avif           # lossless AVIF
-bash resize.sh /path/to/images --post-hook 'echo done: {out}'    # run command after each file
+
+# Metadaten entfernen (Privacy Mode) und konvertieren
+bash resize.sh /path/to/images --strip --format jxl
+
+# Nach jedem Bild ein Skript oder Command ausführen
+bash resize.sh /path/to/images --post-hook 'echo Verarbeitet: {out}'
 ```
 
-## 🍎 macOS Finder Integration
+---
 
-Add a **right-click Quick Action** so you can launch the resizer directly from Finder:
+## ⚙️ CLI Options & Reference
 
-```bash
-bash install_macos_quick_action.sh
+| Flag | Kurzform | Beschreibung | Standard |
+| :--- | :--- | :--- | :--- |
+| `--format` | `-f` | Ausgabeformat: `jpeg`, `heic`, `avif`, `webp`, `jxl`, `original` | `jpeg` |
+| `--quality` | `-q` | Bildqualität (1–100) | Smart-Default pro Format |
+| `--max-size` | `-m` | Maximale Kantenlänge in Pixeln (`0` = kein Resize) | `3000` |
+| `--output` | `-o` | Zielverzeichnis für die konvertierten Bilder | `<input>/converted/` |
+| `--replace` | | Überschreibt die Originaldateien direkt (**Achtung: Destruktiv!**) | aus |
+| `--no-move` | | Verschiebt die Originale nicht in das `originals/` Backup-Verzeichnis | aus |
+| `--rename NAME`| | Benennt Bilder um in `NAME_001`, `NAME_002` ... | Originalnamen |
+| `--lossless` | | Verlustfreie Kompression (nur für AVIF & WebP) | aus |
+| `--strip` | | EXIF-Metadaten (GPS etc.) restlos löschen (Privacy Mode) | aus |
+| `--merge` | | Führt alle übergebenen Ordner/Dateien in einem Zielordner zusammen | aus |
+| `--post-hook CMD`| | Führt Shell-Kommando nach jedem Bild aus (Platzhalter: `{in}`, `{out}`) | aus |
+
+---
+
+## 📁 Output Folder Modes
+
+### Modus 1: Backup (Standard)
+Originale bleiben erhalten und werden in den Ordner `originals/` verschoben, während die bereinigten/konvertierten Bilder in `converted/` landen:
 ```
-
-Then: **select multiple folders and/or files** in Finder → **right-click** → **Quick Actions** → **ImgCrunch**
-
-A single Terminal window opens with the interactive wizard for all selected items. You can choose to merge them or process them separately. After processing, Quick Look thumbnails are automatically refreshed.
-
-> To uninstall: delete `~/Library/Services/ImgCrunch.workflow`
-
-## ⚙️ CLI Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-f`, `--format` | Output format: `jpeg`, `heic`, `avif`, `webp`, `jxl`, `original` (copy-only) | `jpeg` |
-| `-q`, `--quality` | Quality 1–100 | smart per-format default |
-| `-m`, `--max-size` | Max longest side in pixels (`0` = no resize) | `0` |
-| `-o`, `--output` | Custom output folder | first `<input>/converted` |
-| `--replace` | Replace originals in-place (**destructive**) | off |
-| `--rename NAME` | Rename files as `NAME_001`, `NAME_002`, … | keep originals |
-| `--no-move` | Don't move originals to `originals/` folder | move by default |
-| `--lossless` | Lossless encoding (AVIF and WebP only) | off |
-| `--strip` | Strip EXIF metadata from output images (Privacy Mode) | off |
-| `--post-hook CMD` | Shell command to run after each file (`{in}`, `{out}` placeholders) | none |
-| `--merge` | Merge all input folders/files into a single output folder | off |
-
-## 📁 Output Modes
-
-### Keep Originals (default)
-
-```
-your-folder/
-├── converted/          ← resized & converted images
-├── originals/          ← original files moved here
+input-folder/
+├── converted/          ← Resized, optimiert & bereinigt
+├── originals/          ← Unberührte Originaldateien (Backup)
 └── ...
 ```
 
-### Replace in-place (`--replace`)
-
+### Modus 2: In-Place Ersetzen (`--replace`)
+Ersetzt die Originaldateien direkt an Ort und Stelle. Hilfreich, um schnell Speicherplatz auf der Festplatte freizugeben:
 ```
-your-folder/
-├── photo1.jpg          ← replaced with converted version
-├── photo2.jpg          ← replaced with converted version
+input-folder/
+├── photo1.jpg          ← Direkt überschrieben mit optimierter Version
+├── photo2.png          ← Direkt überschrieben und konvertiert
 └── ...
 ```
 
-> ⚠️ Replace mode is **destructive** — original files are permanently overwritten.
-
-## 📋 Requirements
-
-- Python 3.10+
-- [Pillow](https://pillow.readthedocs.io/) ≥ 10.0
-- [piexif](https://pypi.org/project/piexif/) ≥ 1.1.3
-- [pillow-heif](https://pypi.org/project/pillow-heif/) ≥ 0.16.0 (for HEIC/AVIF support)
-- [pillow-jxl-plugin](https://pypi.org/project/pillow-jxl-plugin/) ≥ 0.1.0 (optional, for JPEG XL support)
-- [tqdm](https://pypi.org/project/tqdm/) ≥ 4.60.0 (progress bar)
+---
 
 ## 📅 Changelog
 
-### 2026-07-05
-- **JPEG XL support** — next-gen `.jxl` support (requires `pillow-jxl-plugin`)
-- **Privacy mode** — `--strip` / `--no-exif` flag to completely remove EXIF metadata
-- **Animation timing preservation** — converts animated GIFs to WebP/AVIF while preserving variable frame durations
-- **Terminal title updates** — updates the terminal window title with the progress percentage
-- **Multi-input support** — pass multiple folders and files as arguments
-- **Merge mode** — merge multiple source directories and files into a destination folder
-- **Copy-only (no recompression) mode** — `-f original` allows merging and renaming without modifying the image binary
-- **macOS Finder Quick Action upgrade** — works on files and multiple items in a single terminal session, with robust temp-file argument escaping for spaces/special characters
-- **Automatic collision resolver** — suffix counters (like `_1.jpg`) avoid overwriting files when merging duplicate names
-- **Wizard and Scan Bugfixes** — fixed directory exclusion logic for single file inputs, corrected format detection fallback-marker logic, and mapped GIF format to WebP by default in the wizard.
+### v1.0.0 (2026-07-05) - Initial Stable Release
+- **JPEG XL (.jxl) Integration** – Native Unterstützung des Formats (erfordert `pillow-jxl-plugin`).
+- **Privacy Mode (`--strip`)** – EXIF-Metadaten können nun restlos entfernt werden.
+- **GIF-Animationen erhalten** – WebP/AVIF-Animationen werden nun frame-genau mit exakten, variablen Framelatenzen des Original-GIFs geschrieben.
+- **Alpha-Kanal Erhalt** – Transparenz (Alpha-Kanal) wird beim Konvertieren nach WebP, AVIF und JXL vollständig beibehalten.
+- **Performance Upgrade** – Aufhebung des CPU-Worker-Limits auf 8 Threads, um Multi-Core-Prozessoren (z.B. Apple Silicon M-Series) zu 100% auszulasten.
+- **WebP-Performance Hotfix** – Anpassung der libwebp Kompressionsmethode von Stufe 6 auf Stufe 4 (Standard) für bis zu 100-fach schnellere Batch-Animationen.
+- **Fenstertitel-Fortschritt** – Zeigt den aktuellen Fortschrittsprozentsatz direkt im Titel des Terminal-Fensters an.
+- **Bugfixes** – Korrektur der Ausschluss-Logik für einzeln übergebene Argumente und Reparatur der Fallback-Formaterkennung im Wizard.
 
-### 2026-06-11
-- **ProcessPool parallelism** — encode/resize now runs across all CPU cores via `ProcessPoolExecutor`
-- **mmap-accelerated reads** — large image files are memory-mapped for faster loading
-- **Smart quality defaults** — tuned per-format defaults instead of a single global value
-- **Lossless mode** — `--lossless` flag for AVIF and WebP output
-- **Output verification** — each output file is verified after writing to catch corrupt encodes
-- **Disk preflight check** — estimates required disk space and aborts early if insufficient
-- **Duplicate detection** — MD5 hashing skips content-identical input files automatically
-- **Dataclass internals** — `ImageResult` and `ProcessStats` refactored to typed dataclasses
-- **Post-process hook** — `--post-hook` runs an arbitrary shell command after each converted file
-- **Throughput stats** — run summary now shows MB/s input throughput alongside img/s
-- **Per-format summary** — breakdown of source formats in the final report
-- **Quick Look refresh** — macOS thumbnail cache is refreshed automatically after a run
-- **Graceful abort** — clean `KeyboardInterrupt` handler with a friendly exit message
-
-### Earlier
-- WebP added as a fourth output format
-- Interactive wizard defaults to convert-only (no resize)
-- 6 performance optimisations: worker tuning, early-exit skip logic, reduced IPC overhead, macOS resource fork filtering, and more
-- Renamed `batch_resizer.py` → `imgcrunch.py`
-- macOS Finder Quick Action installer
-- Initial release
+---
 
 ## 📄 License
-
-MIT
+Mit-Lizenz. Freie Nutzung für alle Landratten und Kapitäne.

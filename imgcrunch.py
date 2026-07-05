@@ -71,7 +71,7 @@ C = Color
 
 DEFAULT_MAX_SIZE   = 3000
 OUTPUT_FOLDER_NAME = 'converted'
-MAX_WORKERS        = min(os.cpu_count() or 4, 8)
+MAX_WORKERS        = os.cpu_count() or 4
 
 # Per-format quality defaults (tuned for perceptual equivalence)
 FORMAT_QUALITY_DEFAULTS = {
@@ -498,13 +498,20 @@ def process_image(
             else:
                 # Handle Static Image
                 # Mode conversion
+                # Keep RGBA/LA/P transparency if output format supports alpha (webp, avif, jxl)
+                supports_alpha = format_key in ('webp', 'avif', 'jxl')
                 if img.mode in ('RGBA', 'LA', 'P'):
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                    img = background
-                elif img.mode != 'RGB':
+                    if supports_alpha:
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
+                    else:
+                        # Convert to RGB with white background for JPEG/HEIC
+                        background = Image.new('RGB', img.size, (255, 255, 255))
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                        img = background
+                elif img.mode != 'RGB' and not (supports_alpha and img.mode == 'RGBA'):
                     img = img.convert('RGB')
 
                 # Resize
