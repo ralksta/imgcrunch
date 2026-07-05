@@ -23,7 +23,10 @@ A fast, parallel image cruncher with format conversion. Processes entire folders
 - **CLI mode** — full flag support for scripting and automation
 - **Batch rename** — optional clean naming scheme (`vacation_001.jpg`, `vacation_002.jpg`, …)
 - **Smart skipping** — automatically skips images already in the target format and size
-- **macOS Finder integration** — right-click a folder to launch via Quick Action (see below)
+- **macOS Finder integration** — select multiple folders and/or files in Finder and run the Quick Action
+- **Multi-input & Merge** — pass multiple files or folders; merge them into a single folder and optionally rename them
+- **Original Copy mode** — choose `original` format to copy/rename files without recompressing them
+- **Collision protection** — automatically appends numeric suffixes to duplicate filenames when merging
 - **macOS safe** — ignores `._` resource fork files; triggers Quick Look thumbnail refresh after processing
 
 ## 🚀 Quick Start
@@ -66,9 +69,9 @@ Add a **right-click Quick Action** so you can launch the resizer directly from F
 bash install_macos_quick_action.sh
 ```
 
-Then: **right-click any folder** → **Quick Actions** → **ImgCrunch**
+Then: **select multiple folders and/or files** in Finder → **right-click** → **Quick Actions** → **ImgCrunch**
 
-A Terminal window opens with the interactive wizard for that folder. After processing, Quick Look thumbnails are automatically refreshed.
+A single Terminal window opens with the interactive wizard for all selected items. You can choose to merge them or process them separately. After processing, Quick Look thumbnails are automatically refreshed.
 
 > To uninstall: delete `~/Library/Services/ImgCrunch.workflow`
 
@@ -76,15 +79,16 @@ A Terminal window opens with the interactive wizard for that folder. After proce
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-f`, `--format` | Output format: `jpeg`, `heic`, `avif`, `webp` | `jpeg` |
+| `-f`, `--format` | Output format: `jpeg`, `heic`, `avif`, `webp`, `original` (copy-only) | `jpeg` |
 | `-q`, `--quality` | Quality 1–100 | smart per-format default |
 | `-m`, `--max-size` | Max longest side in pixels (`0` = no resize) | `0` |
-| `-o`, `--output` | Custom output folder | `<input>/converted` |
+| `-o`, `--output` | Custom output folder | first `<input>/converted` |
 | `--replace` | Replace originals in-place (**destructive**) | off |
 | `--rename NAME` | Rename files as `NAME_001`, `NAME_002`, … | keep originals |
 | `--no-move` | Don't move originals to `originals/` folder | move by default |
 | `--lossless` | Lossless encoding (AVIF and WebP only) | off |
 | `--post-hook CMD` | Shell command to run after each file (`{in}`, `{out}` placeholders) | none |
+| `--merge` | Merge all input folders/files into a single output folder | off |
 
 ## 📁 Output Modes
 
@@ -117,6 +121,13 @@ your-folder/
 - [tqdm](https://pypi.org/project/tqdm/) ≥ 4.60.0 (progress bar)
 
 ## 📅 Changelog
+
+### 2026-07-05
+- **Multi-input support** — pass multiple folders and files as arguments
+- **Merge mode** — merge multiple source directories and files into a destination folder
+- **Copy-only (no recompression) mode** — `-f original` allows merging and renaming without modifying the image binary
+- **macOS Finder Quick Action upgrade** — works on files and multiple items in a single terminal session, with robust temp-file argument escaping for spaces/special characters
+- **Automatic collision resolver** — suffix counters (like `_1.jpg`) avoid overwriting files when merging duplicate names
 
 ### 2026-06-11
 - **ProcessPool parallelism** — encode/resize now runs across all CPU cores via `ProcessPoolExecutor`

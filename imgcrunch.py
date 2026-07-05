@@ -181,6 +181,36 @@ def find_images(input_dir: Path) -> list[tuple[Path, int]]:
     return sorted(images, key=lambda x: x[1], reverse=True)
 
 
+def find_images_from_paths(paths: list[Path]) -> list[tuple[Path, int]]:
+    """
+    Recursively find all supported images from a list of paths (directories or files).
+    Returns (path, size_bytes) tuples sorted largest-first.
+    """
+    images = []
+    for p in paths:
+        if p.is_file():
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.name.startswith('._'):
+                try:
+                    size = p.stat().st_size
+                    images.append((p, size))
+                except OSError:
+                    continue
+        elif p.is_dir():
+            for dirpath, _, filenames in os.walk(p):
+                for f in filenames:
+                    if f.startswith('._'):
+                        continue
+                    if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS:
+                        full = Path(dirpath) / f
+                        try:
+                            size = full.stat().st_size
+                        except OSError:
+                            continue
+                        images.append((full, size))
+    # Sort largest-first so big files don't straggle at the end
+    return sorted(images, key=lambda x: x[1], reverse=True)
+
+
 def disk_free_bytes(path: Path) -> int:
     """Return free disk bytes on the volume containing path."""
     stat = shutil.disk_usage(path)
@@ -242,20 +272,34 @@ def refresh_quicklook(paths: list[Path]) -> None:
         pass
 
 
-# ── Output path helper ───────────────────────────────────────────────────────
+def get_input_root(img_path: Path, input_folders: list[Path]) -> Path:
+    """Find which input folder contains the given image path."""
+    for folder in input_folders:
+        try:
+            img_path.relative_to(folder)
+            return folder
+        except ValueError:
+            continue
+    return img_path.parent
 
-def get_output_path(input_path: Path, output_dir: Path, input_root: Path, extension: str,
+
+def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Path], extension: str,
                     rename_base: Optional[str] = None, rename_index: int = 0,
-                    total_count: int = 0) -> Path:
+                    total_count: int = 0, merge_mode: bool = False) -> Path:
+    ext = input_path.suffix if extension == 'original' else extension
     if rename_base:
         pad_width = max(3, len(str(total_count)))
-        new_name = f"{rename_base}_{str(rename_index).zfill(pad_width)}{extension}"
+        new_name = f"{rename_base}_{str(rename_index).zfill(pad_width)}{ext}"
         output_path = output_dir / new_name
     else:
-        relative_path = input_path.relative_to(input_root)
-        output_path = output_dir / relative_path.with_suffix(extension)
+        if merge_mode or input_root is None:
+            output_path = output_dir / input_path.name
+        else:
+            relative_path = input_path.relative_to(input_root)
+            output_path = output_dir / relative_path.with_suffix(ext)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
+
 
 
 # ── Core Image Processing ─────────────────────────────────────────────────────
@@ -301,6 +345,19 @@ def process_image(
         input_bytes=input_bytes or 0,
         input_format=input_ext,
     )
+
+    if format_key == 'original':
+        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+        try:
+            if not result.input_bytes:
+                result.input_bytes = input_path.stat().st_size
+            shutil.copy2(input_path, tmp_path)
+            tmp_path.replace(output_path)
+            result.output_bytes = output_path.stat().st_size
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            result.error = str(e)
+        return result
 
     fmt        = FORMAT_CONFIG[format_key]
     use_piexif = format_key == 'jpeg' and PIEXIF_AVAILABLE
@@ -408,7 +465,7 @@ def process_image(
 
 # ── Startup Wizard ───────────────────────────────────────────────────────────
 
-def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
+def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print()
     print(f"{C.CYAN}╔══════════════════════════════════════════╗{C.RESET}")
     print(f"{C.CYAN}║{C.RESET}        🖼️  {C.BOLD}ImgCrunch{C.RESET}                     {C.CYAN}║{C.RESET}")
@@ -416,13 +473,15 @@ def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
     print(f"{C.CYAN}╚══════════════════════════════════════════╝{C.RESET}")
     print()
 
-    # 1. Folder
-    if prefill_folder:
-        folder_path = Path(prefill_folder).expanduser().resolve()
-        if not folder_path.exists() or not folder_path.is_dir():
-            print(f"  {C.RED}❌  Invalid folder: {folder_path}{C.RESET}")
-            return None
-    else:
+    # 1. Resolve inputs
+    input_paths = []
+    if prefills:
+        for p in prefills:
+            resolved = Path(p).expanduser().resolve()
+            if resolved.exists():
+                input_paths.append(resolved)
+
+    if not input_paths:
         print(f"  {C.BOLD}Enter the path to the folder containing your images:{C.RESET}")
         print()
         while True:
@@ -437,97 +496,149 @@ def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
             if not folder_path.is_dir():
                 print(f"  {C.RED}❌  Not a directory: {folder_path}{C.RESET}")
                 continue
+            input_paths = [folder_path]
             break
 
-    print(f"  {C.GREEN}✅  Folder: {folder_path}{C.RESET}")
-    print()
+    # If multiple inputs are detected, determine if they want to merge
+    merge_mode = False
+    output_dir_str = None
+    replace_mode = False
 
-    print(f"  {C.DIM}Scanning folder...{C.RESET}", end='', flush=True)
-    scanned_images_with_sizes = find_images(folder_path)
+    if len(input_paths) > 1 or (len(input_paths) == 1 and input_paths[0].is_file()):
+        print(f"  {C.GREEN}✅  Found {len(input_paths)} input item(s).{C.RESET}")
+        print()
+        print(f"  {C.BOLD}How would you like to process these items?{C.RESET}")
+        print()
+        print(f"    [{C.CYAN}1{C.RESET}]  Merge into one folder (copy only, no recompression/resizing)")
+        print(f"    [{C.CYAN}2{C.RESET}]  Merge into one folder and convert/resize them")
+        print(f"    [{C.CYAN}3{C.RESET}]  Process individually (keep folders separate)")
+        print()
+        while True:
+            merge_choice = input(f"  Your choice (1/2/3) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
+            if merge_choice in ('1', '2', '3'):
+                break
+            print(f"  {C.YELLOW}⚠️  Please enter 1, 2, or 3.{C.RESET}")
+
+        if merge_choice == '1':
+            merge_mode = True
+            format_key = 'original'
+            target_size = 0
+        elif merge_choice == '2':
+            merge_mode = True
+        else:
+            merge_mode = False
+    else:
+        # Single directory input, ask standard mode
+        print(f"  {C.GREEN}✅  Folder: {input_paths[0]}{C.RESET}")
+        print()
+
+    # Destination folder for merge mode
+    if merge_mode:
+        first_parent = input_paths[0].parent
+        default_output = first_parent / 'merged_images'
+        print(f"  {C.BOLD}Where should the merged images be saved?{C.RESET}")
+        print(f"  {C.DIM}(press Enter for default: {default_output}){C.RESET}")
+        print()
+        output_input = input(f"  Destination path [{C.CYAN}{default_output}{C.RESET}]: ").strip().strip('"').strip("'")
+        if output_input:
+            output_dir_str = str(Path(output_input).expanduser().resolve())
+        else:
+            output_dir_str = str(default_output)
+        print(f"  {C.GREEN}✅  Destination: {output_dir_str}{C.RESET}")
+        print()
+
+    print(f"  {C.DIM}Scanning input(s)...{C.RESET}", end='', flush=True)
+    scanned_images_with_sizes = find_images_from_paths(input_paths)
     scanned_images = [p for p, _ in scanned_images_with_sizes]
     detected_format = detect_dominant_format(scanned_images)
     print(f"\r  {C.DIM}Found {len(scanned_images)} images{C.RESET}          ")
     print()
 
-    # 2. Output mode
-    print(f"  {C.BOLD}How should the output be handled?{C.RESET}")
-    print()
-    print(f"    [{C.CYAN}1{C.RESET}]  Keep originals   — output → {C.DIM}converted/{C.RESET}, originals → {C.DIM}originals/{C.RESET}")
-    print(f"    [{C.CYAN}2{C.RESET}]  Replace in-place  — overwrite originals {C.YELLOW}(destructive){C.RESET}")
-    print()
-    while True:
-        mode_choice = input(f"  Your choice (1/2) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
-        if mode_choice in ('1', '2'):
-            break
-        print(f"  {C.YELLOW}⚠️  Please enter 1 or 2.{C.RESET}")
-
-    replace_mode = mode_choice == '2'
-    if replace_mode:
-        print(f"  {C.YELLOW}⚠️  Replace mode — originals will be overwritten{C.RESET}")
-    else:
-        print(f"  {C.GREEN}✅  Keep originals{C.RESET}")
-    print()
-
-    # 3. Format
-    format_keys    = ['jpeg', 'heic', 'avif', 'webp']
-    detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else '1'
-    format_options = {
-        '1': ('jpeg', 'JPEG  (.jpg)  — universal, great compression'),
-        '2': ('heic', 'HEIC  (.heic) — Apple ecosystem, smaller files'),
-        '3': ('avif', 'AVIF  (.avif) — next-gen, best compression'),
-        '4': ('webp', 'WebP  (.webp) — web-optimised, wide support'),
-    }
-    print(f"  {C.BOLD}Which output format would you like?{C.RESET}")
-    print()
-    for key, (_, label) in format_options.items():
-        marker = f" {C.GREEN}← detected{C.RESET}" if key == detected_index else ""
-        print(f"    [{C.CYAN}{key}{C.RESET}]  {label}{marker}")
-    print()
-    while True:
-        choice = input(f"  Your choice (1/2/3/4) [{C.CYAN}{detected_index}{C.RESET}]: ").strip() or detected_index
-        if choice in format_options:
-            break
-        print(f"  {C.YELLOW}⚠️  Please enter 1–4.{C.RESET}")
-
-    format_key     = format_options[choice][0]
-    default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
-
-    if format_key in ('heic', 'avif') and not HEIF_AVAILABLE:
-        print(f"\n  {C.RED}❌  {format_key.upper()} support requires pillow-heif.{C.RESET}")
-        print(f"      Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
-        return None
-
-    print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
-    print()
-
-    # 4. Max longest side
-    print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
-    print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
-    print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
-    print()
-    while True:
-        size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
-        if not size_input:
-            target_size = 0
-            break
-        try:
-            target_size = int(size_input)
-            if target_size == 0:
+    # 2. Output mode (only if not merging)
+    if not merge_mode:
+        print(f"  {C.BOLD}How should the output be handled?{C.RESET}")
+        print()
+        print(f"    [{C.CYAN}1{C.RESET}]  Keep originals   — output → {C.DIM}converted/{C.RESET}, originals → {C.DIM}originals/{C.RESET}")
+        print(f"    [{C.CYAN}2{C.RESET}]  Replace in-place  — overwrite originals {C.YELLOW}(destructive){C.RESET}")
+        print()
+        while True:
+            mode_choice = input(f"  Your choice (1/2) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
+            if mode_choice in ('1', '2'):
                 break
-            if target_size < 100:
-                print(f"  {C.YELLOW}⚠️  Minimum is 100px (or 0 to skip resizing).{C.RESET}")
-                continue
-            break
-        except ValueError:
-            print(f"  {C.YELLOW}⚠️  Please enter a number.{C.RESET}")
+            print(f"  {C.YELLOW}⚠️  Please enter 1 or 2.{C.RESET}")
 
-    if target_size == 0:
-        print(f"  {C.GREEN}✅  No resizing — convert only{C.RESET}")
+        replace_mode = mode_choice == '2'
+        if replace_mode:
+            print(f"  {C.YELLOW}⚠️  Replace mode — originals will be overwritten{C.RESET}")
+        else:
+            print(f"  {C.GREEN}✅  Keep originals{C.RESET}")
+        print()
+
+    # 3. Format (if not copy-only)
+    if 'format_key' not in locals():
+        format_keys    = ['jpeg', 'heic', 'avif', 'webp']
+        detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else '1'
+        format_options = {
+            '1': ('jpeg', 'JPEG  (.jpg)  — universal, great compression'),
+            '2': ('heic', 'HEIC  (.heic) — Apple ecosystem, smaller files'),
+            '3': ('avif', 'AVIF  (.avif) — next-gen, best compression'),
+            '4': ('webp', 'WebP  (.webp) — web-optimised, wide support'),
+        }
+        print(f"  {C.BOLD}Which output format would you like?{C.RESET}")
+        print()
+        for key, (_, label) in format_options.items():
+            marker = f" {C.GREEN}← detected{C.RESET}" if key == detected_index else ""
+            print(f"    [{C.CYAN}{key}{C.RESET}]  {label}{marker}")
+        print()
+        while True:
+            choice = input(f"  Your choice (1/2/3/4) [{C.CYAN}{detected_index}{C.RESET}]: ").strip() or detected_index
+            if choice in format_options:
+                break
+            print(f"  {C.YELLOW}⚠️  Please enter 1–4.{C.RESET}")
+
+        format_key     = format_options[choice][0]
+
+    if format_key != 'original':
+        default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
+        if format_key in ('heic', 'avif') and not HEIF_AVAILABLE:
+            print(f"\n  {C.RED}❌  {format_key.upper()} support requires pillow-heif.{C.RESET}")
+            print(f"      Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
+            return None
+        print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
-        print(f"  {C.GREEN}✅  Max size: {target_size}px{C.RESET}")
+        default_quality = None
+        print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
     print()
 
-    # 5. Rename (keep mode only)
+    # 4. Max longest side (if not copy-only)
+    if 'target_size' not in locals():
+        print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
+        print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
+        print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
+        print()
+        while True:
+            size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
+            if not size_input:
+                target_size = 0
+                break
+            try:
+                target_size = int(size_input)
+                if target_size == 0:
+                    break
+                if target_size < 100:
+                    print(f"  {C.YELLOW}⚠️  Minimum is 100px (or 0 to skip resizing).{C.RESET}")
+                    continue
+                break
+            except ValueError:
+                print(f"  {C.YELLOW}⚠️  Please enter a number.{C.RESET}")
+
+        if target_size == 0:
+            print(f"  {C.GREEN}✅  No resizing — convert only{C.RESET}")
+        else:
+            print(f"  {C.GREEN}✅  Max size: {target_size}px{C.RESET}")
+        print()
+
+    # 5. Rename (keep mode or merge mode)
     rename_base = None
     if not replace_mode:
         print(f"  {C.BOLD}Would you like to rename all photos with a clean naming scheme?{C.RESET}")
@@ -549,11 +660,18 @@ def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
 
     # Confirmation
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
-    print(f"  {C.BOLD}Mode:{C.RESET}         {'⚠️  Replace in-place' if replace_mode else '📂  Keep originals'}")
+    if merge_mode:
+        print(f"  {C.BOLD}Mode:{C.RESET}         📂  Merge inputs")
+    else:
+        print(f"  {C.BOLD}Mode:{C.RESET}         {'⚠️  Replace in-place' if replace_mode else '📂  Keep originals'}")
     print(f"  {C.BOLD}Format:{C.RESET}       {format_key.upper()}")
-    print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}(smart default for {format_key.upper()}){C.RESET}")
+    if default_quality:
+        print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}(smart default for {format_key.upper()}){C.RESET}")
     print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if target_size == 0 else f'{target_size}px'}")
-    print(f"  {C.BOLD}Folder:{C.RESET}       {folder_path}")
+    if merge_mode:
+        print(f"  {C.BOLD}Output Dir:{C.RESET}   {output_dir_str}")
+    else:
+        print(f"  {C.BOLD}Folder:{C.RESET}       {input_paths[0]}")
     if not replace_mode:
         print(f"  {C.BOLD}Rename:{C.RESET}       {rename_base + '_###' if rename_base else C.DIM + 'keep originals' + C.RESET}")
     print(f"  {C.BOLD}Images:{C.RESET}       {len(scanned_images)}")
@@ -573,17 +691,18 @@ def startup_wizard(prefill_folder: Optional[str] = None) -> Optional[dict]:
         return None
 
     return {
-        'input_folder': str(folder_path),
-        'format':       format_key,
-        'quality':      default_quality,
-        'max_size':     target_size,
-        'no_move':      replace_mode,
-        'output':       None,
-        'rename':       rename_base,
-        'replace':      replace_mode,
-        'lossless':     False,
-        'skip_dupes':   False,
-        'post_hook':    None,
+        'input_folders': [str(p) for p in input_paths],
+        'format':        format_key,
+        'quality':       default_quality,
+        'max_size':      target_size,
+        'no_move':       replace_mode or merge_mode,
+        'output':        output_dir_str,
+        'rename':        rename_base,
+        'replace':       replace_mode,
+        'lossless':      False,
+        'skip_dupes':    False,
+        'post_hook':     None,
+        'merge':         merge_mode,
     }
 
 
@@ -660,13 +779,31 @@ def move_to_originals(input_path: Path, originals_dir: Path, input_root: Path) -
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # Expand --args-file if present
+    if '--args-file' in sys.argv:
+        try:
+            idx = sys.argv.index('--args-file')
+            args_file_path = sys.argv[idx + 1]
+            expanded_args = []
+            with open(args_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.rstrip('\r\n')
+                    if line:
+                        expanded_args.append(line)
+            try:
+                os.unlink(args_file_path)
+            except OSError:
+                pass
+            sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
+        except Exception as e:
+            print(f"Error expanding args file: {e}")
+
     if len(sys.argv) == 1 or '--wizard' in sys.argv:
-        prefill = None
+        prefills = []
         for arg in sys.argv[1:]:
             if arg != '--wizard':
-                prefill = arg
-                break
-        wizard_result = startup_wizard(prefill_folder=prefill)
+                prefills.append(arg)
+        wizard_result = startup_wizard(prefills=prefills)
         if wizard_result is None:
             sys.exit(0)
         args = argparse.Namespace(**wizard_result)
@@ -696,16 +833,16 @@ Examples:
   imgcrunch --wizard /path/to/images                 # interactive wizard
             """
         )
-        parser.add_argument('input_folder',
-                            help='Path to the folder containing images to process')
-        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp'], default='jpeg',
-                            help='Output format (default: jpeg)')
+        parser.add_argument('input_folders', nargs='+',
+                            help='Path to the folder(s) or file(s) containing images to process')
+        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'original'], default='jpeg',
+                            help='Output format (default: jpeg, or original to keep format)')
         parser.add_argument('-q', '--quality', type=int, default=None,
                             help='Compression quality 1–100 (default: smart per-format default)')
         parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
                             help=f'Max longest side in px; 0 = convert only (default: {DEFAULT_MAX_SIZE})')
         parser.add_argument('-o', '--output',
-                            help=f'Custom output folder (default: <input>/{OUTPUT_FOLDER_NAME})')
+                            help=f'Custom output folder (default: first <input>/{OUTPUT_FOLDER_NAME})')
         parser.add_argument('--replace', action='store_true',
                             help='Replace originals in-place (⚠️  destructive, no backup)')
         parser.add_argument('--no-move', action='store_true',
@@ -719,12 +856,15 @@ Examples:
         parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
                             help='Shell command to run after each file. '
                                  'Use {in} and {out} as placeholders.')
+        parser.add_argument('--merge', action='store_true',
+                            help='Merge all input folders/files into a single output folder')
         args = parser.parse_args()
 
     # Resolve quality
     quality = getattr(args, 'quality', None)
     if quality is None:
-        quality = FORMAT_QUALITY_DEFAULTS[args.format]
+        if args.format != 'original':
+            quality = FORMAT_QUALITY_DEFAULTS[args.format]
     args.quality = quality
 
     # Check HEIC/AVIF availability
@@ -733,42 +873,66 @@ Examples:
         print(f"Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
         sys.exit(1)
 
-    input_dir    = Path(args.input_folder).resolve()
+    input_paths  = [Path(p).resolve() for p in args.input_folders]
     replace_mode = getattr(args, 'replace', False)
+    merge_mode   = getattr(args, 'merge', False)
     lossless     = getattr(args, 'lossless', False)
     skip_dupes   = getattr(args, 'skip_dupes', False)
     post_hook    = getattr(args, 'post_hook', None)
     rename_base  = getattr(args, 'rename', None)
-    fmt          = FORMAT_CONFIG[args.format]
+    fmt          = None if args.format == 'original' else FORMAT_CONFIG[args.format]
 
-    if not input_dir.exists():
-        print(f"{C.RED}Error: Input folder does not exist: {input_dir}{C.RESET}")
-        sys.exit(1)
+    for p in input_paths:
+        if not p.exists():
+            print(f"{C.RED}Error: Input path does not exist: {p}{C.RESET}")
+            sys.exit(1)
 
     if replace_mode:
-        tmp_dir      = Path(tempfile.mkdtemp(dir=input_dir, prefix='.resizer_tmp_'))
+        tmp_dir      = Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_'))
         output_dir   = tmp_dir
         originals_dir = None
     else:
-        output_dir    = Path(args.output).resolve() if args.output else input_dir / OUTPUT_FOLDER_NAME
-        originals_dir = input_dir / 'originals'
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+        if args.output:
+            output_dir = Path(args.output).resolve()
+        elif merge_mode:
+            first_parent = input_paths[0].parent
+            output_dir = first_parent / 'merged_images'
+        else:
+            output_dir = input_paths[0] / OUTPUT_FOLDER_NAME
+            
+        if args.output or merge_mode:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
     # Print run config
     print()
     if replace_mode:
         print(f"  {C.BOLD}Mode:{C.RESET}            {C.YELLOW}⚠️  Replace in-place{C.RESET}")
-    print(f"  {C.BOLD}Input folder:{C.RESET}    {input_dir}")
+    elif merge_mode:
+        print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}📂  Merge inputs{C.RESET}")
+    else:
+        print(f"  {C.BOLD}Mode:{C.RESET}            📂  Keep originals")
+        
+    print(f"  {C.BOLD}Input path(s):{C.RESET}")
+    for p in input_paths:
+        print(f"    {p}")
+        
     if not replace_mode:
-        print(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
-    print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
-    print(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}  {C.DIM}(smart default){C.RESET}" if getattr(args, 'quality', None) is None else
-          f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
+        if args.output or merge_mode:
+            print(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
+        else:
+            print(f"  {C.BOLD}Output folder:{C.RESET}   <each_source_folder>/converted/")
+            
+    if args.format == 'original':
+        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}ORIGINAL (copy-only){C.RESET}")
+    else:
+        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
+        
+    if args.quality:
+        print(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
     if lossless:
         print(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
     if args.max_size == 0:
-        print(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only{C.RESET}")
+        print(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
     else:
         print(f"  {C.BOLD}Max size:{C.RESET}        {args.max_size}px longest side")
     if rename_base:
@@ -778,19 +942,26 @@ Examples:
     if post_hook:
         print(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
     print(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
-    if not replace_mode and not args.no_move:
-        print(f"  {C.BOLD}Originals:{C.RESET}       → {originals_dir}")
+    if not replace_mode and not args.no_move and not merge_mode:
+        print(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
     print(f"{C.DIM}{'─' * 60}{C.RESET}")
 
-    # Find images (already sorted largest-first)
-    all_images_with_sizes = find_images(input_dir)
-    exclude_dirs = [str(output_dir)]
-    if originals_dir:
-        exclude_dirs.append(str(originals_dir))
-    images_with_sizes = [
-        (img, sz) for img, sz in all_images_with_sizes
-        if not any(str(img).startswith(d) for d in exclude_dirs)
-    ]
+    # Find images
+    all_images_with_sizes = find_images_from_paths(input_paths)
+    images_with_sizes = []
+    for img, sz in all_images_with_sizes:
+        root = get_input_root(img, input_paths)
+        exclude_dirs = []
+        if args.output:
+            exclude_dirs.append(str(Path(args.output).resolve()))
+        elif merge_mode:
+            exclude_dirs.append(str(output_dir))
+        else:
+            exclude_dirs.append(str(root / OUTPUT_FOLDER_NAME))
+            exclude_dirs.append(str(root / 'originals'))
+            
+        if not any(str(img).startswith(d) for d in exclude_dirs):
+            images_with_sizes.append((img, sz))
 
     if not images_with_sizes:
         print(f"{C.YELLOW}No images found!{C.RESET}")
@@ -823,16 +994,40 @@ Examples:
 
     # Build task list
     tasks: list[tuple[Path, Path, int]] = []
+    seen_outputs = set()
     for idx, img_path in enumerate(images, start=1):
         if str(img_path) in dupe_paths:
             stats.duplicates_skipped += 1
             continue
+            
+        input_root = get_input_root(img_path, input_paths)
+        target_ext = img_path.suffix if args.format == 'original' else fmt['extension']
+        
+        if args.output:
+            target_out_dir = Path(args.output).resolve()
+        elif merge_mode:
+            target_out_dir = output_dir
+        else:
+            target_out_dir = input_root / OUTPUT_FOLDER_NAME
+            
         output_path = get_output_path(
-            img_path, output_dir, input_dir, fmt['extension'],
+            img_path, target_out_dir, input_root if not merge_mode else None, target_ext,
             rename_base=rename_base, rename_index=idx, total_count=len(images),
+            merge_mode=merge_mode
         )
+        
         if output_path.resolve() == img_path.resolve():
             continue
+            
+        if merge_mode and not rename_base:
+            base = output_path.stem
+            ext = output_path.suffix
+            counter = 1
+            while output_path in seen_outputs or output_path.exists():
+                output_path = target_out_dir / f"{base}_{counter}{ext}"
+                counter += 1
+                
+        seen_outputs.add(output_path)
         file_size = image_sizes.get(str(img_path), 0)
         tasks.append((img_path, output_path, file_size))
 
@@ -920,7 +1115,8 @@ Examples:
                 if replace_mode:
                     try:
                         converted_path = Path(result.output)
-                        final_path     = img_path.with_suffix(fmt['extension'])
+                        final_ext = img_path.suffix if args.format == 'original' else fmt['extension']
+                        final_path     = img_path.with_suffix(final_ext)
                         img_path.unlink()
                         shutil.move(str(converted_path), str(final_path))
                         stats.replaced += 1
@@ -929,7 +1125,9 @@ Examples:
                         (tqdm.write if progress else print)(warn)
                 elif not args.no_move:
                     try:
-                        move_to_originals(img_path, originals_dir, input_dir)
+                        input_root = get_input_root(img_path, input_paths)
+                        specific_originals_dir = input_root / 'originals'
+                        move_to_originals(img_path, specific_originals_dir, input_root)
                         stats.moved += 1
                     except Exception as e:
                         warn = f"  {C.YELLOW}⚠ Could not move {img_path.name}: {e}{C.RESET}"
@@ -952,9 +1150,14 @@ Examples:
 
     print_summary(stats, elapsed, output_dir)
     if replace_mode:
-        print(f"\n  {C.BOLD}Files replaced in:{C.RESET} {input_dir}\n")
+        print(f"\n  {C.BOLD}Files replaced in place.{C.RESET}\n")
+    elif merge_mode:
+        print(f"\n  {C.BOLD}Merged output saved to:{C.RESET} {output_dir}\n")
     else:
-        print(f"\n  {C.BOLD}Output saved to:{C.RESET} {output_dir}\n")
+        if args.output:
+            print(f"\n  {C.BOLD}Output saved to:{C.RESET} {output_dir}\n")
+        else:
+            print(f"\n  {C.BOLD}Outputs saved to respective '<folder>/converted/' directories.{C.RESET}\n")
 
 
 if __name__ == '__main__':

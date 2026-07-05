@@ -69,7 +69,7 @@ cat > "$CONTENTS_DIR/Info.plist" << 'PLIST_EOF'
 			</dict>
 			<key>NSSendFileTypes</key>
 			<array>
-				<string>public.folder</string>
+				<string>public.item</string>
 			</array>
 		</dict>
 	</array>
@@ -142,9 +142,11 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW_EOF
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>for f in "\$@"; do
-	osascript -e "tell application \"Terminal\"" -e "activate" -e "do script \"bash '\${SCRIPT_PATH}' --wizard '\$f'\"" -e "end tell"
-done</string>
+					<string>ARGS_FILE=\$(mktemp /tmp/imgcrunch_args.XXXXXX)
+for f in "\$@"; do
+	echo "\$f" >> "\$ARGS_FILE"
+done
+osascript -e "tell application \"Terminal\"" -e "activate" -e "do script \"bash '\${SCRIPT_PATH}' --wizard --args-file '\$ARGS_FILE'\"" -e "end tell"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>
@@ -283,7 +285,7 @@ done</string>
 			<string>/System/Library/CoreServices/Finder.app</string>
 		</array>
 		<key>inputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.folder</string>
+		<string>com.apple.Automator.fileSystemObject</string>
 		<key>outputTypeIdentifier</key>
 		<string>com.apple.Automator.nothing</string>
 		<key>presentationMode</key>
@@ -295,7 +297,7 @@ done</string>
 		<key>serviceApplicationPath</key>
 		<string>/System/Library/CoreServices/Finder.app</string>
 		<key>serviceInputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.folder</string>
+		<string>com.apple.Automator.fileSystemObject</string>
 		<key>serviceOutputTypeIdentifier</key>
 		<string>com.apple.Automator.nothing</string>
 		<key>serviceProcessesInput</key>
