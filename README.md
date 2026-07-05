@@ -51,17 +51,20 @@ bash install_macos_quick_action.sh
 
 ---
 
-## 🔥 Performance Tuning (Pillow-SIMD)
+## 🔥 Performance Tuning (Pillow-SIMD for Intel/AMD)
 
-For maximum processing speed (especially when resizing large batches of high-resolution images), you can install **Pillow-SIMD**. It leverages SSE4, AVX2, or NEON (on Apple Silicon) to speed up image resizing operations by **4x to 6x**:
+For maximum processing speed on **Intel/AMD (x86_64) CPUs** (especially when resizing large batches of high-resolution images), you can install **Pillow-SIMD**. It leverages SSE4 and AVX2 to speed up image resizing operations by **4x to 6x**:
 
 ```bash
 # Uninstall standard Pillow
 pip uninstall pillow
 
-# Install Pillow-SIMD with AVX2/NEON optimizations
+# Install Pillow-SIMD with AVX2 optimizations (Intel/AMD only)
 CC="clang -mavx2" pip install pillow-simd
 ```
+
+> [!NOTE]
+> **Apple Silicon (M-Series ARM Macs):** Do not install Pillow-SIMD on Apple Silicon. Pillow-SIMD requires x86-specific SIMD instructions (SSE/AVX) and will fail to compile on arm64. The standard `Pillow` package is already natively compiled and highly optimized for Apple Silicon (utilizing macOS Accelerate and ARM NEON) out of the box.
 
 ---
 
