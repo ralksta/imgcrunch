@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import mmap
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 try:
     import piexif
     PIEXIF_AVAILABLE = True
@@ -172,24 +173,6 @@ def detect_dominant_format(images: list[Path]) -> str:
     return dominant if counts[dominant] > total * 0.5 else 'jpeg'
 
 
-def find_images(input_dir: Path) -> list[tuple[Path, int]]:
-    """Recursively find all supported images. Returns (path, size_bytes) tuples."""
-    images = []
-    for dirpath, _, filenames in os.walk(input_dir):
-        for f in filenames:
-            if f.startswith('._'):
-                continue
-            if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS:
-                full = Path(dirpath) / f
-                try:
-                    size = full.stat().st_size
-                except OSError:
-                    continue
-                images.append((full, size))
-    # Sort largest-first so big files don't straggle at the end (#2)
-    return sorted(images, key=lambda x: x[1], reverse=True)
-
-
 def find_images_from_paths(paths: list[Path]) -> list[tuple[Path, int]]:
     """
     Recursively find all supported images from a list of paths (directories or files).
@@ -248,20 +231,35 @@ def preflight_disk_check(images_with_sizes: list[tuple[Path, int]], output_dir: 
 
 def build_duplicate_set(images: list[Path]) -> set[str]:
     """
-    Hash every image; return the set of paths (str) that are content-duplicates
-    of an earlier file. The first occurrence is kept, rest are skipped.
+    Return the set of paths (str) that are content-duplicates of an earlier
+    file. First occurrence is kept, rest are skipped.
+
+    Two-stage for speed: group by file size first (a cheap stat), then only
+    hash files that share a size with another file. Content-identical files
+    always share a size, so this misses nothing while avoiding the cost of
+    hashing every unique-sized file.
     """
-    seen: dict[str, str] = {}   # hash → first path
-    dupes: set[str] = set()
+    by_size: dict[int, list[Path]] = defaultdict(list)
     for p in images:
         try:
-            h = file_md5(p)
+            by_size[p.stat().st_size].append(p)
         except OSError:
             continue
-        if h in seen:
-            dupes.add(str(p))
-        else:
-            seen[h] = str(p)
+
+    dupes: set[str] = set()
+    for group in by_size.values():
+        if len(group) < 2:
+            continue
+        seen: dict[str, str] = {}   # hash → first path (in original order)
+        for p in group:
+            try:
+                h = file_md5(p)
+            except OSError:
+                continue
+            if h in seen:
+                dupes.add(str(p))
+            else:
+                seen[h] = str(p)
     return dupes
 
 
@@ -304,7 +302,8 @@ def get_input_root(img_path: Path, input_folders: list[Path]) -> Path:
 
 def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Path], extension: str,
                     rename_base: Optional[str] = None, rename_index: int = 0,
-                    total_count: int = 0, merge_mode: bool = False) -> Path:
+                    total_count: int = 0, merge_mode: bool = False,
+                    create_dirs: bool = True) -> Path:
     ext = input_path.suffix if extension == 'original' else extension
     if rename_base:
         pad_width = max(3, len(str(total_count)))
@@ -323,7 +322,8 @@ def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Pat
                     output_path = output_path.with_suffix(ext)
             else:
                 output_path = output_dir / relative_path.with_suffix(ext)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if create_dirs:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
 
 
@@ -339,12 +339,14 @@ def needs_resize(width: int, height: int, max_size: int) -> bool:
 
 
 def calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]:
+    # Clamp the short side to >=1: extreme aspect ratios (e.g. 100000x30)
+    # can otherwise round to 0 and make Pillow's resize() raise.
     if width >= height:
         new_width  = target
-        new_height = int(height * (target / width))
+        new_height = max(1, int(height * (target / width)))
     else:
         new_height = target
-        new_width  = int(width * (target / height))
+        new_width  = max(1, int(width * (target / height)))
     return new_width, new_height
 
 
@@ -399,7 +401,8 @@ def process_image(
                             loop=img.info.get('loop', 0)
                         )
                     else:
-                        img.save(tmp_path, img.format)
+                        # Bake EXIF orientation into the pixels before dropping metadata
+                        ImageOps.exif_transpose(img).save(tmp_path, img.format)
             else:
                 # Fast standard copy
                 shutil.copy2(input_path, tmp_path)
@@ -419,21 +422,36 @@ def process_image(
             result.input_bytes = input_path.stat().st_size
 
         with Image.open(input_path) as img:
+            is_animated_gif = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
+
+            # When stripping metadata, bake the EXIF orientation into the pixels
+            # first — otherwise the output would silently appear rotated.
+            if strip_exif and not is_animated_gif:
+                img = ImageOps.exif_transpose(img)
+
             width, height = img.size
             result.original_size = (width, height)
 
-            # Early bail-out: already target format, no resize, no mode conversion needed, and no strip
+            # Early bail-out: already target format, no resize, no mode conversion
+            # needed, and no strip. Copy straight through to the output location so
+            # the destination folder still contains every image.
             target_ext = fmt['extension']
             already_target = (
                 input_ext == target_ext
                 or (input_ext in ('.jpg', '.jpeg') and target_ext == '.jpg')
             )
-            is_animated_gif = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
             if already_target and not needs_resize(width, height, max_size) \
                     and img.mode in ('RGB', 'L') and not lossless and not strip_exif and not is_animated_gif:
-                result.skipped     = True
-                result.new_size    = (width, height)
-                result.output_bytes = result.input_bytes
+                result.skipped  = True
+                result.new_size = (width, height)
+                tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+                try:
+                    shutil.copy2(input_path, tmp_path)
+                    tmp_path.replace(output_path)
+                    result.output_bytes = output_path.stat().st_size
+                except Exception as e:
+                    tmp_path.unlink(missing_ok=True)
+                    result.error = str(e)
                 return result
 
             # Extract EXIF (if not stripping)
@@ -948,6 +966,7 @@ Examples:
   imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
   imgcrunch /path/to/images --strip                  # remove EXIF metadata
   imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
+  imgcrunch /path/to/images --dry-run                # preview plan, write nothing
   imgcrunch --wizard /path/to/images                 # interactive wizard
             """
         )
@@ -978,6 +997,8 @@ Examples:
                                  'Use {in} and {out} as placeholders.')
         parser.add_argument('--merge', action='store_true',
                             help='Merge all input folders/files into a single output folder')
+        parser.add_argument('--dry-run', action='store_true', dest='dry_run',
+                            help='Show what would be processed without writing anything')
         args = parser.parse_args()
 
     # Resolve quality
@@ -985,7 +1006,12 @@ Examples:
     if quality is None:
         if args.format != 'original':
             quality = FORMAT_QUALITY_DEFAULTS[args.format]
+    elif not (1 <= quality <= 100):
+        print(f"{C.RED}Error: --quality must be between 1 and 100 (got {quality}){C.RESET}")
+        sys.exit(1)
     args.quality = quality
+
+    dry_run = getattr(args, 'dry_run', False)
 
     # Check HEIC/AVIF/JXL availability
     if args.format in ('heic', 'avif') and not HEIF_AVAILABLE:
@@ -1025,7 +1051,7 @@ Examples:
         else:
             output_dir = input_paths[0] / OUTPUT_FOLDER_NAME
             
-        if args.output or merge_mode:
+        if (args.output or merge_mode) and not dry_run:
             output_dir.mkdir(parents=True, exist_ok=True)
 
     # Print run config
@@ -1125,28 +1151,38 @@ Examples:
 
     stats = BatchStats()
 
+    # Filter out duplicates up front so the rename counter (and its zero-pad
+    # width) reflects only the files actually written — otherwise skipped dupes
+    # would leave gaps like pic_001, pic_003, ...
+    images_to_process: list[Path] = []
+    for img_path in images:
+        if str(img_path) in dupe_paths:
+            stats.duplicates_skipped += 1
+        else:
+            images_to_process.append(img_path)
+
     # Build task list
     tasks: list[tuple[Path, Path, int]] = []
     seen_outputs = set()
-    for idx, img_path in enumerate(images, start=1):
-        if str(img_path) in dupe_paths:
-            stats.duplicates_skipped += 1
-            continue
-            
+    for idx, img_path in enumerate(images_to_process, start=1):
         input_root = get_input_root(img_path, input_paths)
         target_ext = img_path.suffix if args.format == 'original' else fmt['extension']
-        
-        if args.output:
+
+        if replace_mode:
+            # Stage in the temp dir; files are moved back over the originals
+            # afterwards. Avoids leaving an empty converted/ in the source.
+            target_out_dir = output_dir
+        elif args.output:
             target_out_dir = Path(args.output).resolve()
         elif merge_mode:
             target_out_dir = output_dir
         else:
             target_out_dir = input_root / OUTPUT_FOLDER_NAME
-            
+
         output_path = get_output_path(
             img_path, target_out_dir, input_root if not merge_mode else None, target_ext,
-            rename_base=rename_base, rename_index=idx, total_count=len(images),
-            merge_mode=merge_mode
+            rename_base=rename_base, rename_index=idx, total_count=len(images_to_process),
+            merge_mode=merge_mode, create_dirs=not dry_run
         )
         
         if output_path.resolve() == img_path.resolve():
@@ -1163,6 +1199,25 @@ Examples:
         seen_outputs.add(output_path)
         file_size = image_sizes.get(str(img_path), 0)
         tasks.append((img_path, output_path, file_size))
+
+    # Dry run: report the plan and exit without writing, moving, or replacing.
+    if dry_run:
+        total_in = sum(sz for _, _, sz in tasks)
+        print(f"  {C.BOLD}{C.CYAN}Dry run{C.RESET} — nothing will be written.\n")
+        print(f"  Would process {C.BOLD}{len(tasks)}{C.RESET} image(s), "
+              f"{format_bytes(total_in)} of input.")
+        if stats.duplicates_skipped:
+            print(f"  Would skip {stats.duplicates_skipped} duplicate(s).")
+        print()
+        preview = tasks[:10]
+        for img_path, output_path, _ in preview:
+            print(f"    {C.DIM}{img_path.name}{C.RESET}  →  {output_path}")
+        if len(tasks) > len(preview):
+            print(f"    {C.DIM}… and {len(tasks) - len(preview)} more{C.RESET}")
+        print()
+        if replace_mode:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        sys.exit(0)
 
     start_time = time.time()
 
@@ -1207,14 +1262,12 @@ Examples:
                 (tqdm.write if progress else print)(msg)
                 stats.errors += 1
 
-            elif result.skipped:
-                stats.processed          += 1
-                stats.skipped            += 1
-                stats.total_input_bytes  += result.input_bytes
-                stats.total_output_bytes += result.output_bytes
-
             else:
                 stats.processed          += 1
+                if result.skipped:
+                    # Already-optimal file: copied through untouched, but it
+                    # still gets moved/replaced like any other output.
+                    stats.skipped += 1
                 stats.total_input_bytes  += result.input_bytes
                 stats.total_output_bytes += result.output_bytes
 
@@ -1240,9 +1293,11 @@ Examples:
                 if progress:
                     progress.set_postfix_str(img_path.name[-30:], refresh=False)
 
-                # Post-hook (#18)
+                # Post-hook (#18) — shell-quote paths to avoid injection/breakage
                 if post_hook:
-                    cmd = post_hook.replace('{in}', str(img_path)).replace('{out}', str(output_path))
+                    cmd = (post_hook
+                           .replace('{in}', shlex.quote(str(img_path)))
+                           .replace('{out}', shlex.quote(str(output_path))))
                     try:
                         subprocess.run(cmd, shell=True, timeout=30,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

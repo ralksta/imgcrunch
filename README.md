@@ -115,6 +115,8 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--strip` | | Strip all EXIF metadata from output images (Privacy Mode) | off |
 | `--merge` | | Merge all input folders/files into a single output folder | off |
 | `--post-hook CMD`| | Shell command to run after each file (placeholders: `{in}`, `{out}`) | off |
+| `--skip-dupes` | | Skip files that are content-identical to an already-processed file | off |
+| `--dry-run` | | Preview what would be processed without writing anything | off |
 
 ---
 
