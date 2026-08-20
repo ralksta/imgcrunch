@@ -12,6 +12,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 - **Lossless Mode**: `--lossless` flag for lossless AVIF and WebP outputs.
 - **Smart Quality**: Auto-tuned quality levels per output format to achieve the perfect balance between file size and visual fidelity.
 - **Copy Mode (`original`)**: Merge and rename images without recompressing them (1:1 binary copies).
+- **Rename-Only Mode (`--rename-only`)**: Renames files where they lie — no conversion, no resizing, no copies. Instant even for thousands of files.
 
 ### 🚀 High-Speed Performance
 - **True Parallelism**: CPU-intensive resizing and encoding run in parallel across all available CPU cores using Python's `ProcessPoolExecutor`.
@@ -88,6 +89,9 @@ bash resize.sh /path/to/images --format heic --quality 80
 # Resize images to a max longest side of 2000px and rename (vacation_001.jpg etc.)
 bash resize.sh /path/to/images --max-size 2000 --rename vacation
 
+# Only rename, in-place — no recompression, no copies (vacation_001.jpg, ...)
+bash resize.sh /path/to/images --rename-only --rename vacation
+
 # Overwrite original files directly (Warning: Destructive!)
 bash resize.sh /path/to/images --replace --format avif
 
@@ -111,6 +115,7 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--replace` | | Replace originals in-place (**Warning: Destructive!**) | off |
 | `--no-move` | | Do not move originals to the `originals/` backup folder | off |
 | `--rename NAME`| | Rename output files to `NAME_001`, `NAME_002` ... | Keep original names |
+| `--rename-only` | | Rename in-place only — no conversion, resize or copies. Requires `--rename`. Numbering follows filename order. | off |
 | `--lossless` | | Lossless encoding (AVIF and WebP only) | off |
 | `--strip` | | Strip all EXIF metadata from output images (Privacy Mode) | off |
 | `--merge` | | Merge all input folders/files into a single output folder | off |

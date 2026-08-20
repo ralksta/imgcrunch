@@ -618,6 +618,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     merge_mode = False
     output_dir_str = None
     replace_mode = False
+    rename_only = False
 
     if len(input_paths) > 1 or (len(input_paths) == 1 and input_paths[0].is_file()):
         print(f"  {C.GREEN}✅  Found {len(input_paths)} input item(s).{C.RESET}")
@@ -627,12 +628,13 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"    [{C.CYAN}1{C.RESET}]  Merge into one folder (copy only, no recompression/resizing)")
         print(f"    [{C.CYAN}2{C.RESET}]  Merge into one folder and convert/resize them")
         print(f"    [{C.CYAN}3{C.RESET}]  Process individually (keep folders separate)")
+        print(f"    [{C.CYAN}4{C.RESET}]  Just rename — files stay where they are, no conversion")
         print()
         while True:
-            merge_choice = input(f"  Your choice (1/2/3) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
-            if merge_choice in ('1', '2', '3'):
+            merge_choice = input(f"  Your choice (1/2/3/4) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
+            if merge_choice in ('1', '2', '3', '4'):
                 break
-            print(f"  {C.YELLOW}⚠️  Please enter 1, 2, or 3.{C.RESET}")
+            print(f"  {C.YELLOW}⚠️  Please enter 1, 2, 3, or 4.{C.RESET}")
 
         if merge_choice == '1':
             merge_mode = True
@@ -640,6 +642,11 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             target_size = 0
         elif merge_choice == '2':
             merge_mode = True
+        elif merge_choice == '4':
+            rename_only = True
+            format_key = 'original'
+            target_size = 0
+            merge_mode = False
         else:
             merge_mode = False
     else:
@@ -669,21 +676,27 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print(f"\r  {C.DIM}Found {len(scanned_images)} images{C.RESET}          ")
     print()
 
-    # 2. Output mode (only if not merging)
-    if not merge_mode:
+    # 2. Output mode (only if not merging / renaming)
+    if not merge_mode and not rename_only:
         print(f"  {C.BOLD}How should the output be handled?{C.RESET}")
         print()
         print(f"    [{C.CYAN}1{C.RESET}]  Keep originals   — output → {C.DIM}converted/{C.RESET}, originals → {C.DIM}originals/{C.RESET}")
         print(f"    [{C.CYAN}2{C.RESET}]  Replace in-place  — overwrite originals {C.YELLOW}(destructive){C.RESET}")
+        print(f"    [{C.CYAN}3{C.RESET}]  Just rename       — files stay where they are, no conversion")
         print()
         while True:
-            mode_choice = input(f"  Your choice (1/2) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
-            if mode_choice in ('1', '2'):
+            mode_choice = input(f"  Your choice (1/2/3) [{C.CYAN}1{C.RESET}]: ").strip() or '1'
+            if mode_choice in ('1', '2', '3'):
                 break
-            print(f"  {C.YELLOW}⚠️  Please enter 1 or 2.{C.RESET}")
+            print(f"  {C.YELLOW}⚠️  Please enter 1, 2, or 3.{C.RESET}")
 
         replace_mode = mode_choice == '2'
-        if replace_mode:
+        rename_only  = mode_choice == '3'
+        if rename_only:
+            format_key  = 'original'
+            target_size = 0
+            print(f"  {C.GREEN}✅  Just rename — no conversion, no resizing{C.RESET}")
+        elif replace_mode:
             print(f"  {C.YELLOW}⚠️  Replace mode — originals will be overwritten{C.RESET}")
         else:
             print(f"  {C.GREEN}✅  Keep originals{C.RESET}")
@@ -713,9 +726,9 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
                 break
             print(f"  {C.YELLOW}⚠️  Please enter 1–5.{C.RESET}")
 
-        format_key     = format_options[choice][0]
+        format_key = format_options[choice][0]
 
-    if format_key != 'original':
+    if format_key != 'original' and not rename_only:
         default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
         if format_key in ('heic', 'avif') and not HEIF_AVAILABLE:
             print(f"\n  {C.RED}❌  {format_key.upper()} support requires pillow-heif.{C.RESET}")
@@ -728,7 +741,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
         default_quality = None
-        print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
+        if rename_only:
+            print(f"  {C.GREEN}✅  Just rename — no conversion, no resizing{C.RESET}")
+        else:
+            print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
     print()
 
     # 4. Max longest side (if not copy-only)
@@ -759,9 +775,29 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Max size: {target_size}px{C.RESET}")
         print()
 
-    # 5. Rename (keep mode or merge mode)
+    # 5. Rename (keep mode, merge mode, or the whole point in rename-only mode)
     rename_base = None
-    if not replace_mode:
+    if rename_only:
+        print(f"  {C.BOLD}What should the new base name be?{C.RESET}")
+        print(f"  {C.DIM}e.g. \"vacation\" → vacation_001.jpg, vacation_002.jpg, ...{C.RESET}")
+        print(f"  {C.YELLOW}Files are renamed where they lie — the old names are gone.{C.RESET}")
+        print()
+        while True:
+            raw = input(f"  Base name [{C.CYAN}cancel{C.RESET}]: ").strip()
+            if not raw:
+                print()
+                print(f"  {C.DIM}No name given — nothing was changed. 👋{C.RESET}")
+                print()
+                return None
+            cleaned = raw.replace(' ', '_')
+            cleaned = ''.join(c for c in cleaned if c.isalnum() or c in ('_', '-'))
+            if cleaned:
+                rename_base = cleaned
+                print(f"  {C.GREEN}✅  Rename: {rename_base}_001, {rename_base}_002, ...{C.RESET}")
+                break
+            print(f"  {C.YELLOW}⚠️  Invalid name — use letters, digits, - or _.{C.RESET}")
+        print()
+    elif not replace_mode:
         print(f"  {C.BOLD}Would you like to rename all photos with a clean naming scheme?{C.RESET}")
         print(f"  {C.DIM}e.g. \"vacation\" → vacation_001.jpg, vacation_002.jpg, ...{C.RESET}")
         print(f"  {C.DIM}(leave blank to keep original filenames){C.RESET}")
@@ -779,20 +815,56 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             rename_base = None
         print()
 
-    # 6. Privacy Mode (EXIF stripping)
-    print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
-    print(f"  {C.DIM}This removes GPS coordinates, camera model, etc.{C.RESET}")
-    print()
-    strip_input = input(f"  Strip metadata? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
-    strip_mode = strip_input in ('y', 'yes')
-    if strip_mode:
-        print(f"  {C.GREEN}✅  Privacy Mode: EXIF metadata will be stripped{C.RESET}")
-    else:
-        print(f"  {C.GREEN}✅  EXIF metadata will be preserved{C.RESET}")
-    print()
+    # 6. Privacy Mode (EXIF stripping) — not applicable when only renaming
+    strip_mode = False
+    if not rename_only:
+        print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
+        print(f"  {C.DIM}This removes GPS coordinates, camera model, etc.{C.RESET}")
+        print()
+        strip_input = input(f"  Strip metadata? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+        strip_mode = strip_input in ('y', 'yes')
+        if strip_mode:
+            print(f"  {C.GREEN}✅  Privacy Mode: EXIF metadata will be stripped{C.RESET}")
+        else:
+            print(f"  {C.GREEN}✅  EXIF metadata will be preserved{C.RESET}")
+        print()
 
     # Confirmation
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
+    if rename_only:
+        print(f"  {C.BOLD}Mode:{C.RESET}         ✏️  Just rename (in-place)")
+        print(f"  {C.BOLD}Folder(s):{C.RESET}")
+        for pth in input_paths:
+            print(f"    {pth}")
+        print(f"  {C.BOLD}Rename:{C.RESET}       {rename_base}_###")
+        print(f"  {C.BOLD}Images:{C.RESET}       {len(scanned_images)}")
+        print(f"{C.DIM}{'─' * 44}{C.RESET}")
+        print()
+        print(f"  {C.YELLOW}⚠️  The original filenames cannot be restored afterwards.{C.RESET}")
+        print()
+        confirm = input(f"  Start renaming? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
+        if confirm and confirm not in ('y', 'yes'):
+            print()
+            print(f"  {C.DIM}No worries — nothing was changed. 👋{C.RESET}")
+            print()
+            return None
+        return {
+            'input_folders': [str(p) for p in input_paths],
+            'format':        'original',
+            'quality':       None,
+            'max_size':      0,
+            'no_move':       True,
+            'output':        None,
+            'rename':        rename_base,
+            'rename_only':   True,
+            'replace':       False,
+            'lossless':      False,
+            'skip_dupes':    False,
+            'post_hook':     None,
+            'merge':         False,
+            'strip':         False,
+        }
+
     if merge_mode:
         print(f"  {C.BOLD}Mode:{C.RESET}         📂  Merge inputs")
     else:
@@ -832,6 +904,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'no_move':       replace_mode or merge_mode,
         'output':        output_dir_str,
         'rename':        rename_base,
+        'rename_only':   False,
         'replace':       replace_mode,
         'lossless':      False,
         'skip_dupes':    False,
@@ -911,6 +984,73 @@ def move_to_originals(input_path: Path, originals_dir: Path, input_root: Path) -
     return dest_path
 
 
+def rename_in_place(images: list[Path], rename_base: str, dry_run: bool = False) -> int:
+    """Rename images where they lie — no copying, no recompression.
+
+    Numbering follows path order (not the size-descending order used for
+    scheduling), so <base>_001 is the first file by name, which is what a
+    human expects. Renaming happens in two phases via unique temp names so a
+    run whose targets collide with existing filenames (renaming to "urlaub"
+    in a folder that already holds urlaub_001.jpg) can't clobber anything.
+    """
+    ordered = sorted(images, key=lambda p: (str(p.parent), p.name))
+    if not ordered:
+        return 0
+
+    pad_width = max(3, len(str(len(ordered))))
+    targets   = [
+        (img, img.parent / f"{rename_base}_{str(idx).zfill(pad_width)}{img.suffix}")
+        for idx, img in enumerate(ordered, start=1)
+    ]
+
+    if dry_run:
+        for src, dest in targets[:10]:
+            print(f"  {C.DIM}{src.name}{C.RESET} → {C.CYAN}{dest.name}{C.RESET}")
+        if len(targets) > 10:
+            print(f"  {C.DIM}… and {len(targets) - 10} more{C.RESET}")
+        return len(targets)
+
+    # Phase 1: everything to a unique temp name in its own folder.
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for idx, (src, dest) in enumerate(targets, start=1):
+            if src == dest:
+                staged.append((src, dest))
+                continue
+            tmp = src.parent / f".imgcrunch_rn_{idx}{src.suffix}"
+            counter = 0
+            while tmp.exists():
+                counter += 1
+                tmp = src.parent / f".imgcrunch_rn_{idx}_{counter}{src.suffix}"
+            src.rename(tmp)
+            staged.append((tmp, dest))
+    except OSError as e:
+        print(f"\n  {C.RED}❌  Rename aborted: {e}{C.RESET}")
+        print(f"  {C.YELLOW}Staged files are named .imgcrunch_rn_* and must be "
+              f"restored manually.{C.RESET}")
+        raise
+
+    # Phase 2: temp names to their final targets.
+    renamed = 0
+    leftovers: list[Path] = []
+    for tmp, dest in staged:
+        if tmp == dest:
+            renamed += 1
+            continue
+        try:
+            tmp.rename(dest)
+            renamed += 1
+        except OSError as e:
+            print(f"  {C.YELLOW}⚠ Could not rename to {dest.name}: {e}{C.RESET}")
+            leftovers.append(tmp)
+
+    if leftovers:
+        print(f"\n  {C.YELLOW}⚠️  {len(leftovers)} file(s) remain staged as "
+              f".imgcrunch_rn_* and need manual attention.{C.RESET}")
+
+    return renamed
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -964,6 +1104,8 @@ Examples:
   imgcrunch /path/to/images --skip-dupes             # skip content-identical files
   imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
   imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
+  imgcrunch /path/to/images --rename-only --rename vacation
+                                                    # rename in-place only, no recompression
   imgcrunch /path/to/images --strip                  # remove EXIF metadata
   imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
   imgcrunch /path/to/images --dry-run                # preview plan, write nothing
@@ -986,6 +1128,9 @@ Examples:
                             help="Keep originals in place (don't move to originals/)")
         parser.add_argument('--rename', type=str, default=None, metavar='NAME',
                             help='Rename output files as NAME_001, NAME_002, ...')
+        parser.add_argument('--rename-only', action='store_true', dest='rename_only',
+                            help='Only rename files in-place (no conversion, no resize, '
+                                 'no copies). Requires --rename NAME.')
         parser.add_argument('--lossless', action='store_true',
                             help='Lossless encode (AVIF and WebP only)')
         parser.add_argument('--skip-dupes', action='store_true',
@@ -1031,7 +1176,63 @@ Examples:
     strip        = getattr(args, 'strip', False)
     post_hook    = getattr(args, 'post_hook', None)
     rename_base  = getattr(args, 'rename', None)
+    rename_only  = getattr(args, 'rename_only', False)
     fmt          = None if args.format == 'original' else FORMAT_CONFIG[args.format]
+
+    if rename_only and not rename_base:
+        print(f"{C.RED}Error: --rename-only needs a base name — add --rename NAME{C.RESET}")
+        sys.exit(1)
+    if replace_mode and rename_base and not rename_only:
+        # Replace mode moves output back onto the original filename, so a
+        # rename would be silently discarded. Say so instead of lying.
+        print(f"{C.RED}Error: --replace cannot rename — the output is moved back onto "
+              f"the original filename.{C.RESET}")
+        print(f"{C.DIM}Use --rename-only to rename in-place, or drop --replace to write "
+              f"renamed files to converted/.{C.RESET}")
+        sys.exit(1)
+
+    # ── Rename-only: no conversion pipeline at all ───────────────────────────
+    if rename_only:
+        print()
+        print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}✏️  Rename only (in-place){C.RESET}")
+        print(f"  {C.BOLD}Input path(s):{C.RESET}")
+        for pth in input_paths:
+            print(f"    {pth}")
+        print(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
+        print(f"  {C.DIM}No conversion, no resizing, no copies — the original "
+              f"filenames are gone afterwards.{C.RESET}")
+        print(f"{C.DIM}{'─' * 60}{C.RESET}")
+
+        explicit_files = {pth.resolve() for pth in input_paths if pth.is_file()}
+        rename_targets: list[Path] = []
+        for img, _sz in find_images_from_paths(input_paths):
+            if img.resolve() in explicit_files:
+                rename_targets.append(img)
+                continue
+            root = get_input_root(img, input_paths)
+            skip_roots = (str(root / OUTPUT_FOLDER_NAME), str(root / 'originals'))
+            if any(str(img).startswith(d) for d in skip_roots):
+                continue
+            rename_targets.append(img)
+
+        if not rename_targets:
+            print(f"{C.YELLOW}No images found!{C.RESET}")
+            sys.exit(0)
+
+        print(f"  Found {C.BOLD}{len(rename_targets)}{C.RESET} images\n")
+        if dry_run:
+            print(f"  {C.CYAN}Dry run — nothing will be renamed:{C.RESET}")
+
+        rn_start = time.time()
+        renamed  = rename_in_place(rename_targets, rename_base, dry_run=dry_run)
+        rn_time  = time.time() - rn_start
+
+        if dry_run:
+            print(f"\n  {C.CYAN}Would rename {renamed} file(s).{C.RESET}\n")
+        else:
+            print(f"\n  {C.GREEN}✅  Renamed {renamed} file(s) in {rn_time:.2f}s{C.RESET}\n")
+        set_terminal_title("[ImgCrunch] Done")
+        return
 
     for p in input_paths:
         if not p.exists():
