@@ -493,3 +493,72 @@ class TestTargetSize:
         assert res.error is None
         with Image.open(out) as img:
             assert img.size == (800, 600)
+
+    def test_animated_image_warns_but_still_succeeds(self, tmp_path):
+        """
+        --target-size is out of scope for animated GIFs (search is a
+        single-frame operation). The run must still succeed and write the
+        file — just with a warning that the budget was not applied.
+        """
+        src = tmp_path / "anim.gif"
+        out = tmp_path / "anim.webp"
+
+        frame1 = Image.new("RGB", (200, 150), (255, 0, 0))
+        frame2 = Image.new("RGB", (200, 150), (0, 255, 0))
+        frame1.save(src, save_all=True, append_images=[frame2], duration=100, loop=0)
+
+        settings = ic.JobSettings(format_key="webp", quality=85, max_size=0,
+                                  target_bytes=1)  # impossibly small on purpose
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        assert out.exists(), "animated output must still be written despite the warning"
+        assert res.warning is not None
+        assert "target-size" in res.warning
+
+    def test_generous_target_does_not_override_explicit_quality(self, tmp_path):
+        """
+        search_quality's hi bound must come from settings.quality, not the
+        function default of 100 — otherwise a generous --target-size raises
+        quality (and file size) above what the user explicitly asked for.
+        """
+        src = tmp_path / "noise.png"
+        plain_out = tmp_path / "plain.jpg"
+        target_out = tmp_path / "target.jpg"
+        self._noisy_image(src, size=(800, 600))
+
+        plain_settings = ic.JobSettings(format_key="jpeg", quality=70, max_size=0)
+        plain_res = ic.process_image(str(src), str(plain_out), plain_settings)
+
+        target_settings = ic.JobSettings(format_key="jpeg", quality=70, max_size=0,
+                                         target_bytes=5_000_000)
+        target_res = ic.process_image(str(src), str(target_out), target_settings)
+
+        assert plain_res.error is None
+        assert target_res.error is None
+        assert target_out.stat().st_size <= plain_out.stat().st_size, (
+            "a generous --target-size must not inflate output past the "
+            "explicit --quality setting"
+        )
+
+    def test_hard_target_shrinks_dimensions_to_fit(self, tmp_path):
+        """
+        A target the full-resolution image cannot reach even at the lowest
+        quality forces sizing.search_scale's shrink path, not just
+        search_quality. Full-size noise at quality 1 measures ~87 KB, so a
+        30 KB budget is unreachable without downscaling.
+        """
+        src = tmp_path / "noise.png"
+        out = tmp_path / "noise.jpg"
+        self._noisy_image(src, size=(1600, 1200))
+
+        settings = ic.JobSettings(format_key="jpeg", quality=95, max_size=0,
+                                  target_bytes=30_000)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        assert out.stat().st_size <= 30_000
+        with Image.open(out) as img:
+            assert img.size[0] < 1600 and img.size[1] < 1200, (
+                f"expected downscale below (1600, 1200), got {img.size}"
+            )

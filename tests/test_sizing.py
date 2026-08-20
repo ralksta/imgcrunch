@@ -4,6 +4,8 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sizing  # noqa: E402
@@ -275,9 +277,6 @@ class TestSearchScale:
                 )
 
 
-import pytest
-
-
 class TestParseSize:
     def test_plain_number_is_bytes(self):
         assert sizing.parse_size("250000") == 250_000
@@ -301,3 +300,11 @@ class TestParseSize:
     def test_garbage_is_rejected(self):
         with pytest.raises(ValueError):
             sizing.parse_size("big")
+
+    def test_infinity_is_rejected(self):
+        with pytest.raises(ValueError):
+            sizing.parse_size("inf")
+
+    def test_nan_is_rejected(self):
+        with pytest.raises(ValueError):
+            sizing.parse_size("nan")

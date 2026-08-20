@@ -35,6 +35,9 @@ def parse_size(text: str) -> int:
     except ValueError:
         raise ValueError(f"not a size: {text!r}") from None
 
+    if not math.isfinite(value):
+        raise ValueError(f"not a size: {text!r}")
+
     size = int(value * _SIZE_UNITS[unit])
     if size <= 0:
         raise ValueError(f"size must be positive, got {text!r}")

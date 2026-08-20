@@ -158,6 +158,7 @@ class ProcessResult:
     output_bytes:   int          = 0
     input_format:   str          = ''   # source extension (for per-format summary)
     error:          Optional[str] = None
+    warning:        Optional[str] = None
 
 
 @dataclass
@@ -534,6 +535,15 @@ def process_image(
             # Handle Animation (GIF/etc -> WebP/AVIF)
             is_animated = is_animated_gif and format_key in ('webp', 'avif')
             if is_animated:
+                # --target-size is deliberately out of scope for animated
+                # images (the search is single-frame, per-quality logic);
+                # say so instead of silently writing an oversized file.
+                if settings.target_bytes:
+                    result.warning = (
+                        "--target-size does not apply to animated images; "
+                        "wrote at normal quality instead."
+                    )
+
                 from PIL import ImageSequence
                 frames = []
                 durations = []
@@ -623,7 +633,7 @@ def process_image(
                             frame.save(buf, fmt['pillow_format'], **kwargs)
                             return buf.getvalue()
 
-                        hit = sizing.search_quality(encode, settings.target_bytes)
+                        hit = sizing.search_quality(encode, settings.target_bytes, hi=quality)
                         if hit is not None:
                             return hit[1], len(hit[1])
                         # Only the no-fit branch needs the floor, so pay for it
@@ -1618,6 +1628,10 @@ Examples:
                         f"{C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
                     )
                     (tqdm.write if progress else print)(msg)
+
+                if result.warning:
+                    warn = f"  {C.YELLOW}⚠ {img_path.name}: {result.warning}{C.RESET}"
+                    (tqdm.write if progress else print)(warn)
 
                 output_path = Path(result.output)
                 output_paths_written.append(output_path)
