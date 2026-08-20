@@ -159,6 +159,18 @@ input-folder/
 
 ## 📅 Changelog
 
+### Unreleased
+*Everything below has landed on `main` since the v1.0.0 tag.*
+
+- **Target Size (`--target-size`)** – Force every output below a byte budget (`500k`, `1.5m`). Quality is binary-searched first, capped at the requested `--quality`; if no quality fits, dimensions are reduced until one does, preserving aspect ratio and never upscaling. Files that cannot reach the target are reported as errors rather than written oversized. Available on the command line and as a wizard step.
+- **Encoder Preflight** – Encodes a 1×1 image before the batch starts to verify the output format is genuinely encodable on this machine, aborting with a `pip install` hint instead of failing on the first image. Replaces the previous check, which only tested whether the optional plugin imported.
+- **Rename-Only Mode (`--rename-only`)** – Renames files where they lie: no decode, no encode, no copies. Numbering follows filename order, and a two-phase rename via temporary names makes a base name that collides with existing files safe. Also reachable from the wizard.
+- **Wizard: no more silently swallowed flags** – Any flag passed beside `--wizard` used to be discarded without a word (everything but `--wizard` became a path prefill, and non-paths were dropped). It now aborts with a message naming the flag.
+- **Correctness fixes** – Clamp the short side to ≥1 px so extreme aspect ratios cannot round to zero and crash the resize; bake EXIF orientation into the pixels before `--strip` drops metadata, so stripped images no longer appear rotated; copy already-optimal files through to the output folder instead of silently omitting them; stage `--replace` in the temp dir so it stops leaving an empty `converted/` behind; number renamed files after duplicate filtering so the sequence has no gaps.
+- **`--dry-run`** – Preview the plan without writing anything.
+- **Hardening** – Faster duplicate detection (group by size, hash only on collision), `--quality` range validation, and shell-quoted `{in}`/`{out}` in `--post-hook`.
+- **Internals** – Sizing and search arithmetic extracted into a Pillow-free `sizing.py`, testable without encoding real images; worker parameters bundled into a picklable `JobSettings` dataclass whose `forces_reencode()` centralises the byte-copy decision. Test suite grown from 27 to 96 tests.
+
 ### v1.0.0 (2026-07-05) - Initial Stable Release
 - **JPEG XL (.jxl) Integration** – Native JXL output support (requires `pillow-jxl-plugin`).
 - **Privacy Mode (`--strip`)** – Complete EXIF metadata stripping.
