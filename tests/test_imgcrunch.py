@@ -268,3 +268,148 @@ class TestDryRun:
         assert not (tmp_path / "converted").exists()
         assert not (tmp_path / "originals").exists()
         assert "dry" in r.stdout.lower() or "would" in r.stdout.lower()
+
+
+# ── rename_in_place: pure-ish unit tests ─────────────────────────────────────
+
+class TestRenameInPlace:
+    def _imgs(self, tmp_path, names):
+        out = []
+        for i, n in enumerate(names):
+            p = tmp_path / n
+            Image.new("RGB", (10 + i, 10), (i, i, i)).save(p)
+            out.append(p)
+        return out
+
+    def test_numbering_follows_name_order_not_size(self, tmp_path):
+        # b.png is deliberately the largest file; it must still become _002.
+        a = tmp_path / "a.png"
+        b = tmp_path / "b.png"
+        c = tmp_path / "c.png"
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(a)
+        Image.new("RGB", (900, 900), (7, 90, 200)).save(b)
+        Image.new("RGB", (10, 10), (2, 2, 2)).save(c)
+        assert b.stat().st_size > a.stat().st_size
+
+        n = ic.rename_in_place([b, c, a], "pic", dry_run=False)
+        assert n == 3
+        assert sorted(p.name for p in tmp_path.glob("pic_*")) == [
+            "pic_001.png", "pic_002.png", "pic_003.png"
+        ]
+        # a (first alphabetically) -> pic_001
+        with Image.open(tmp_path / "pic_001.png") as im:
+            assert im.size == (10, 10)
+        with Image.open(tmp_path / "pic_002.png") as im:
+            assert im.size == (900, 900)
+
+    def test_extensions_preserved(self, tmp_path):
+        a = tmp_path / "a.png"
+        b = tmp_path / "b.jpg"
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(a)
+        Image.new("RGB", (10, 10), (2, 2, 2)).save(b)
+        ic.rename_in_place([a, b], "x", dry_run=False)
+        assert (tmp_path / "x_001.png").exists()
+        assert (tmp_path / "x_002.jpg").exists()
+
+    def test_padding_scales_past_999(self, tmp_path):
+        imgs = self._imgs(tmp_path, [f"src_{i:04d}.png" for i in range(1001)])
+        ic.rename_in_place(imgs, "p", dry_run=False)
+        assert (tmp_path / "p_0001.png").exists()
+        assert (tmp_path / "p_1001.png").exists()
+
+    def test_collision_with_existing_target_names(self, tmp_path):
+        # Renaming to a base that already matches existing filenames must not
+        # destroy data: two-phase rename keeps every file.
+        a = tmp_path / "urlaub_002.png"
+        b = tmp_path / "urlaub_001.png"
+        c = tmp_path / "zzz.png"
+        Image.new("RGB", (11, 11), (1, 1, 1)).save(a)
+        Image.new("RGB", (12, 12), (2, 2, 2)).save(b)
+        Image.new("RGB", (13, 13), (3, 3, 3)).save(c)
+
+        n = ic.rename_in_place([a, b, c], "urlaub", dry_run=False)
+        assert n == 3
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "urlaub_001.png", "urlaub_002.png", "urlaub_003.png"
+        ]
+        # urlaub_001.png (alphabetically first) keeps its 11x11... no:
+        # order is urlaub_001, urlaub_002, zzz -> sizes 12, 11, 13
+        with Image.open(tmp_path / "urlaub_001.png") as im:
+            assert im.size == (12, 12)
+        with Image.open(tmp_path / "urlaub_002.png") as im:
+            assert im.size == (11, 11)
+        with Image.open(tmp_path / "urlaub_003.png") as im:
+            assert im.size == (13, 13)
+
+    def test_files_stay_in_their_own_folder(self, tmp_path):
+        d1 = tmp_path / "one"
+        d2 = tmp_path / "two"
+        d1.mkdir()
+        d2.mkdir()
+        a = d1 / "a.png"
+        b = d2 / "b.png"
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(a)
+        Image.new("RGB", (10, 10), (2, 2, 2)).save(b)
+        ic.rename_in_place([a, b], "f", dry_run=False)
+        assert (d1 / "f_001.png").exists()
+        assert (d2 / "f_002.png").exists()
+
+    def test_dry_run_changes_nothing(self, tmp_path):
+        a = tmp_path / "a.png"
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(a)
+        ic.rename_in_place([a], "p", dry_run=True)
+        assert a.exists()
+        assert not (tmp_path / "p_001.png").exists()
+
+    def test_no_leftover_temp_files(self, tmp_path):
+        imgs = self._imgs(tmp_path, ["a.png", "b.png", "c.png"])
+        ic.rename_in_place(imgs, "q", dry_run=False)
+        assert not list(tmp_path.glob("*imgcrunch_rn*"))
+
+
+# ── CLI integration: --rename-only ───────────────────────────────────────────
+
+class TestRenameOnlyCLI:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def test_renames_in_place_without_recompressing(self, tmp_path):
+        a = tmp_path / "a.jpg"
+        b = tmp_path / "b.jpg"
+        Image.new("RGB", (4000, 2000), (255, 0, 0)).save(a)
+        Image.new("RGB", (300, 300), (0, 0, 255)).save(b)
+        before_a = a.read_bytes()
+
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "urlaub")
+        assert r.returncode == 0, r.stderr
+        assert not (tmp_path / "converted").exists()
+        assert not (tmp_path / "originals").exists()
+        assert not a.exists() and not b.exists()
+        out_a = tmp_path / "urlaub_001.jpg"
+        assert out_a.exists()
+        assert (tmp_path / "urlaub_002.jpg").exists()
+        # byte-identical: no recompression, no resize despite 4000px source
+        assert out_a.read_bytes() == before_a
+
+    def test_requires_rename_base(self, tmp_path):
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(tmp_path / "a.png")
+        r = self._run(str(tmp_path), "--rename-only")
+        assert r.returncode != 0
+        assert "--rename" in (r.stdout + r.stderr)
+
+    def test_dry_run_writes_nothing(self, tmp_path):
+        a = tmp_path / "a.png"
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(a)
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "p", "--dry-run")
+        assert r.returncode == 0, r.stderr
+        assert a.exists()
+        assert not (tmp_path / "p_001.png").exists()
+
+    def test_replace_with_rename_is_rejected(self, tmp_path):
+        Image.new("RGB", (10, 10), (1, 1, 1)).save(tmp_path / "a.png")
+        r = self._run(str(tmp_path), "-f", "jpeg", "--replace", "--rename", "x")
+        assert r.returncode != 0
+        assert "--rename-only" in (r.stdout + r.stderr)
