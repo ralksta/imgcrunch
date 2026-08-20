@@ -11,7 +11,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 - **Transparency Preservation**: Keeps the alpha channel (RGBA) intact when converting to formats that support transparency (WebP, AVIF, JXL).
 - **Lossless Mode**: `--lossless` flag for lossless AVIF and WebP outputs.
 - **Smart Quality**: Auto-tuned quality levels per output format to achieve the perfect balance between file size and visual fidelity.
-- **Target Size (`--target-size`)**: Force every output below a byte budget (`500k`, `1.5m`). Quality is lowered first; if that isn't enough, the image is scaled down until it fits. Files that can't reach the target are reported as errors instead of being written oversized. Cannot be combined with `--lossless` (no quality to trade) or `--format original` (no re-encoding). Does not apply to animated images (GIF→WebP/AVIF); those are written at normal quality with a warning. Note: When dimensions are reduced during the target-size search, EXIF `PixelXDimension` and `PixelYDimension` tags still describe the pre-shrink size (affects JPEG and other formats that preserve EXIF).
+- **Target Size (`--target-size`)**: Force every output below a byte budget (`500k`, `1.5m`), on the command line or as a wizard step. Quality is lowered first; if that isn't enough, the image is scaled down until it fits. Files that can't reach the target are reported as errors instead of being written oversized. Cannot be combined with `--lossless` (no quality to trade) or `--format original` (no re-encoding). Does not apply to animated images (GIF→WebP/AVIF); those are written at normal quality with a warning. Note: When dimensions are reduced during the target-size search, EXIF `PixelXDimension` and `PixelYDimension` tags still describe the pre-shrink size (affects JPEG and other formats that preserve EXIF).
 - **Copy Mode (`original`)**: Merge and rename images without recompressing them (1:1 binary copies).
 - **Rename-Only Mode (`--rename-only`)**: Renames files where they lie — no conversion, no resizing, no copies. Instant even for thousands of files.
 
@@ -74,10 +74,11 @@ CC="clang -mavx2" pip install pillow-simd
 ## 🎮 Usage Guide
 
 ### 1. Interactive Wizard (Recommended)
-Launch the wizard without arguments. It guides you step-by-step through formatting, resizing, renaming, and privacy options:
+Launch the wizard without arguments. It guides you step-by-step through formatting, resizing, max file size, renaming, and privacy options:
 ```bash
 bash resize.sh
 ```
+The wizard asks its own questions, so it takes no flags — `--wizard` combined with any flag is rejected rather than silently ignored. Use the flags directly (below) when you want a non-interactive run.
 
 ### 2. CLI Mode (Automation)
 Ideal for scripting and automation:
