@@ -8,6 +8,7 @@ Preserves EXIF metadata. Parallel processing with progress bar.
 
 import argparse
 import hashlib
+import io
 import mmap
 import os
 import shlex
@@ -180,6 +181,44 @@ def format_bytes(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
+
+
+# Install hints per format, used when the encoder probe fails.
+ENCODER_HINTS = {
+    'heic': 'pip install pillow-heif',
+    'avif': 'pip install pillow-heif',
+    'jxl':  'pip install pillow-jxl-plugin',
+}
+
+
+def probe_encoder(format_key: str) -> Optional[str]:
+    """
+    Verify the output format can actually be *encoded* on this machine.
+
+    Importing pillow_heif successfully does not mean AVIF encoding works —
+    the plugin may be present without its encoder. Encoding a 1x1 image is
+    the only honest check, and it costs microseconds once per run.
+
+    Returns None when the format is fine, otherwise an install hint.
+    """
+    if format_key == 'original':
+        return None
+
+    fmt = FORMAT_CONFIG.get(format_key)
+    if fmt is None:
+        return f"Unknown output format: {format_key}"
+
+    try:
+        buf = io.BytesIO()
+        Image.new('RGB', (1, 1)).save(buf, fmt['pillow_format'], quality=80)
+    except Exception as exc:
+        hint = ENCODER_HINTS.get(format_key)
+        msg = f"{format_key.upper()} output is not encodable here ({exc})."
+        if hint:
+            msg += f"\nInstall with: {hint}"
+        return msg
+
+    return None
 
 
 def file_md5(path: Path) -> str:
@@ -1175,14 +1214,10 @@ Examples:
 
     dry_run = getattr(args, 'dry_run', False)
 
-    # Check HEIC/AVIF/JXL availability
-    if args.format in ('heic', 'avif') and not HEIF_AVAILABLE:
-        print(f"{C.RED}Error: {args.format.upper()} support requires pillow-heif{C.RESET}")
-        print(f"Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
-        sys.exit(1)
-    if args.format == 'jxl' and not JXL_AVAILABLE:
-        print(f"{C.RED}Error: JXL support requires pillow-jxl-plugin{C.RESET}")
-        print(f"Install with: {C.CYAN}pip install pillow-jxl-plugin{C.RESET}")
+    # Encoder preflight: fail before touching a single image, not on file 200.
+    encoder_problem = probe_encoder(args.format)
+    if encoder_problem:
+        print(f"{C.RED}Error: {encoder_problem}{C.RESET}")
         sys.exit(1)
 
     input_paths  = [Path(p).resolve() for p in args.input_folders]

@@ -420,3 +420,28 @@ class TestRenameOnlyCLI:
         r = self._run(str(tmp_path), "-f", "jpeg", "--replace", "--rename", "x")
         assert r.returncode != 0
         assert "--rename-only" in (r.stdout + r.stderr)
+
+
+# ── Encoder preflight ────────────────────────────────────────────────────────
+
+class TestProbeEncoder:
+    def test_jpeg_is_always_encodable(self):
+        assert ic.probe_encoder("jpeg") is None
+
+    def test_original_needs_no_encoder(self):
+        assert ic.probe_encoder("original") is None
+
+    def test_unknown_format_reports_a_hint(self):
+        hint = ic.probe_encoder("definitely-not-a-format")
+        assert hint is not None
+        assert isinstance(hint, str)
+
+    def test_hint_names_the_install_command(self, monkeypatch):
+        """A broken encoder must produce an actionable message, not a traceback."""
+        def boom(*args, **kwargs):
+            raise OSError("encoder not available")
+
+        monkeypatch.setattr(ic.Image.Image, "save", boom)
+        hint = ic.probe_encoder("avif")
+        assert hint is not None
+        assert "pip install" in hint
