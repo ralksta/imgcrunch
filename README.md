@@ -11,6 +11,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 - **Transparency Preservation**: Keeps the alpha channel (RGBA) intact when converting to formats that support transparency (WebP, AVIF, JXL).
 - **Lossless Mode**: `--lossless` flag for lossless AVIF and WebP outputs.
 - **Smart Quality**: Auto-tuned quality levels per output format to achieve the perfect balance between file size and visual fidelity.
+- **Target Size (`--target-size`)**: Force every output below a byte budget (`500k`, `1.5m`). Quality is lowered first; if that isn't enough, the image is scaled down until it fits. Files that can't reach the target are reported as errors instead of being written oversized. Note: When dimensions are reduced, JPEG EXIF `PixelXDimension` and `PixelYDimension` tags still describe the original size.
 - **Copy Mode (`original`)**: Merge and rename images without recompressing them (1:1 binary copies).
 - **Rename-Only Mode (`--rename-only`)**: Renames files where they lie — no conversion, no resizing, no copies. Instant even for thousands of files.
 
@@ -29,6 +30,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 - **Privacy Mode (`--strip` / `--no-exif`)**: Strips all EXIF metadata (GPS coordinates, camera model, etc.) completely before saving.
 - **Atomic Writes**: Writes to a temporary file first and renames it only after successful output verification. Prevents corrupted outputs.
 - **Preflight Disk Check**: Estimates required disk space before processing starts and aborts if the disk is at risk of running full.
+- **Encoder Preflight**: Verifies the output format can actually be encoded on this machine before the batch starts — a missing AVIF or JXL encoder fails immediately with an install hint instead of on image 200.
 
 ---
 
@@ -97,6 +99,12 @@ bash resize.sh /path/to/images --replace --format avif
 
 # Strip metadata (Privacy Mode) and convert to JXL
 bash resize.sh /path/to/images --strip --format jxl
+
+# Force every output under 500 KB (lower quality first, then scale down if needed)
+bash resize.sh /path/to/images --target-size 500k
+
+# Convert to WebP with target size 200 KB and max dimension 2000px
+bash resize.sh /path/to/images -f webp --target-size 200k -m 2000
 
 # Run a custom shell command after processing each file
 bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
