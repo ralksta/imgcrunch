@@ -660,3 +660,96 @@ class TestTargetSizeCLI:
                        "--target-size", "50k")
         assert r.returncode != 0
         assert "--rename-only" in (r.stdout + r.stderr)
+
+
+# ── Wizard: target size ──────────────────────────────────────────────────────
+
+def _drive_wizard(monkeypatch, input_dir, answers=None):
+    """
+    Run startup_wizard against a real folder, answering its prompts.
+
+    `answers` maps a lowercased substring of a prompt to the reply, or to a
+    list of replies consumed in order (for testing re-prompts). Any prompt
+    that matches nothing gets "" — i.e. the user pressed Enter. Matching on
+    the prompt text rather than on call order keeps these tests from
+    breaking every time a step is inserted somewhere else in the wizard.
+
+    Returns (result_dict, seen_prompts).
+    """
+    import re as _re
+
+    answers = dict(answers or {})
+    seen = []
+
+    def fake_input(prompt=""):
+        plain = _re.sub(r"\033\[[0-9;]*m", "", str(prompt)).lower()
+        seen.append(plain)
+        for needle, reply in answers.items():
+            if needle in plain:
+                if isinstance(reply, list):
+                    return reply.pop(0) if reply else ""
+                return reply
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return ic.startup_wizard(prefills=[str(input_dir)]), seen
+
+
+@pytest.fixture
+def wizard_dir(tmp_path):
+    Image.new("RGB", (900, 700), (200, 40, 40)).save(tmp_path / "one.jpg")
+    Image.new("RGB", (640, 480), (40, 200, 40)).save(tmp_path / "two.jpg")
+    return tmp_path
+
+
+class TestWizardTargetSize:
+    def test_wizard_asks_and_returns_what_was_typed(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {"max file size": "500k"})
+        assert result is not None
+        assert any("max file size" in p for p in seen), \
+            "the wizard never asked for a byte budget"
+        # Stored raw so main() runs it through the same parse path as the CLI.
+        assert result["target_size"] == "500k"
+
+    def test_enter_means_no_budget(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+        assert result is not None
+        assert result["target_size"] is None
+
+    def test_invalid_input_reprompts_instead_of_aborting(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {"max file size": ["banana", "300k"]})
+        assert result is not None
+        assert result["target_size"] == "300k"
+        assert len([p for p in seen if "max file size" in p]) == 2
+
+    def test_skipped_in_rename_only_mode(self, monkeypatch, wizard_dir):
+        # Output-mode choice 3 is "Just rename" — nothing is re-encoded, so a
+        # byte budget cannot apply and must not be asked for.
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {"(1/2/3)": "3", "base name": "urlaub"})
+        assert result is not None
+        assert result["rename_only"] is True
+        assert result["target_size"] is None
+        assert not any("max file size" in p for p in seen)
+
+
+class TestWizardFlagRejection:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            capture_output=True, text=True, timeout=120, input="",
+        )
+
+    def test_target_size_beside_wizard_is_rejected(self, tmp_path):
+        r = self._run("--wizard", str(tmp_path), "--target-size", "500k")
+        assert r.returncode != 0
+        out = r.stdout + r.stderr
+        assert "--target-size" in out
+        assert "--wizard" in out
+
+    def test_any_flag_beside_wizard_is_rejected(self, tmp_path):
+        r = self._run("--wizard", str(tmp_path), "--strip")
+        assert r.returncode != 0
+        assert "--strip" in (r.stdout + r.stderr)

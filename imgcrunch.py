@@ -723,6 +723,11 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print(f"{C.CYAN}╚══════════════════════════════════════════╝{C.RESET}")
     print()
 
+    # Set by the copy-only / rename-only branches below; None means the
+    # corresponding question still has to be asked.
+    max_px       = None
+    target_bytes = None
+
     # 1. Resolve inputs
     input_paths = []
     if prefills:
@@ -774,13 +779,13 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         if merge_choice == '1':
             merge_mode = True
             format_key = 'original'
-            target_size = 0
+            max_px = 0
         elif merge_choice == '2':
             merge_mode = True
         elif merge_choice == '4':
             rename_only = True
             format_key = 'original'
-            target_size = 0
+            max_px = 0
             merge_mode = False
         else:
             merge_mode = False
@@ -829,7 +834,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         rename_only  = mode_choice == '3'
         if rename_only:
             format_key  = 'original'
-            target_size = 0
+            max_px      = 0
             print(f"  {C.GREEN}✅  Just rename — no conversion, no resizing{C.RESET}")
         elif replace_mode:
             print(f"  {C.YELLOW}⚠️  Replace mode — originals will be overwritten{C.RESET}")
@@ -878,7 +883,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print()
 
     # 4. Max longest side (if not copy-only)
-    if 'target_size' not in locals():
+    if max_px is None:
         print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
         print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
         print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
@@ -886,26 +891,56 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         while True:
             size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
             if not size_input:
-                target_size = 0
+                max_px = 0
                 break
             try:
-                target_size = int(size_input)
-                if target_size == 0:
+                max_px = int(size_input)
+                if max_px == 0:
                     break
-                if target_size < 100:
+                if max_px < 100:
                     print(f"  {C.YELLOW}⚠️  Minimum is 100px (or 0 to skip resizing).{C.RESET}")
                     continue
                 break
             except ValueError:
                 print(f"  {C.YELLOW}⚠️  Please enter a number.{C.RESET}")
 
-        if target_size == 0:
+        if max_px == 0:
             print(f"  {C.GREEN}✅  No resizing — convert only{C.RESET}")
         else:
-            print(f"  {C.GREEN}✅  Max size: {target_size}px{C.RESET}")
+            print(f"  {C.GREEN}✅  Max size: {max_px}px{C.RESET}")
         print()
 
-    # 5. Rename (keep mode, merge mode, or the whole point in rename-only mode)
+    # 5. Max file size (only when we actually re-encode)
+    # A byte budget needs something to trade away, so it is only offered when
+    # a real output format was chosen. That also makes the CLI's --target-size
+    # conflicts (--format original, --lossless) unreachable from here.
+    if format_key != 'original' and not rename_only:
+        print(f"  {C.BOLD}What should the max file size per image be?{C.RESET}")
+        print(f"  {C.DIM}Quality is lowered first, then dimensions if needed.{C.RESET}")
+        print(f"  {C.DIM}e.g. 500k, 1.5m  (press Enter for no limit){C.RESET}")
+        print()
+        while True:
+            size_input = input(f"  Max file size [{C.CYAN}no limit{C.RESET}]: ").strip()
+            if not size_input:
+                target_bytes = None
+                break
+            try:
+                # Validate here for immediate feedback, but hand main() the raw
+                # string so there is exactly one parsing path, shared with the CLI.
+                parsed = sizing.parse_size(size_input)
+            except ValueError as exc:
+                print(f"  {C.YELLOW}⚠️  {exc} — try 500k, 1.5m, or a plain byte count.{C.RESET}")
+                continue
+            target_bytes = size_input
+            break
+
+        if target_bytes is None:
+            print(f"  {C.GREEN}✅  No file size limit{C.RESET}")
+        else:
+            print(f"  {C.GREEN}✅  Max file size: {format_bytes(parsed)}{C.RESET}")
+        print()
+
+    # 6. Rename (keep mode, merge mode, or the whole point in rename-only mode)
     rename_base = None
     if rename_only:
         print(f"  {C.BOLD}What should the new base name be?{C.RESET}")
@@ -945,7 +980,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             rename_base = None
         print()
 
-    # 6. Privacy Mode (EXIF stripping) — not applicable when only renaming
+    # 7. Privacy Mode (EXIF stripping) — not applicable when only renaming
     strip_mode = False
     if not rename_only:
         print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
@@ -988,6 +1023,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             'rename':        rename_base,
             'rename_only':   True,
             'replace':       False,
+            'target_size':   None,
             'lossless':      False,
             'skip_dupes':    False,
             'post_hook':     None,
@@ -1002,7 +1038,9 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print(f"  {C.BOLD}Format:{C.RESET}       {format_key.upper()}")
     if default_quality:
         print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}(smart default for {format_key.upper()}){C.RESET}")
-    print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if target_size == 0 else f'{target_size}px'}")
+    print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if max_px == 0 else f'{max_px}px'}")
+    if target_bytes:
+        print(f"  {C.BOLD}Max file size:{C.RESET} {format_bytes(sizing.parse_size(target_bytes))}")
     if merge_mode:
         print(f"  {C.BOLD}Output Dir:{C.RESET}   {output_dir_str}")
     else:
@@ -1030,12 +1068,13 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'input_folders': [str(p) for p in input_paths],
         'format':        format_key,
         'quality':       default_quality,
-        'max_size':      target_size,
+        'max_size':      max_px,
         'no_move':       replace_mode or merge_mode,
         'output':        output_dir_str,
         'rename':        rename_base,
         'rename_only':   False,
         'replace':       replace_mode,
+        'target_size':   target_bytes,
         'lossless':      False,
         'skip_dupes':    False,
         'post_hook':     None,
@@ -1202,6 +1241,18 @@ def main():
             sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
         except Exception as e:
             print(f"Error expanding args file: {e}")
+
+    if '--wizard' in sys.argv:
+        # Everything else on the line becomes a path prefill for the wizard, and
+        # non-existent paths are dropped silently — which used to swallow flags
+        # whole. Say so instead: the wizard asks its own questions.
+        stray = [a for a in sys.argv[1:] if a.startswith('-') and a != '--wizard']
+        if stray:
+            print(f"{C.RED}Error: {stray[0]} cannot be combined with --wizard — "
+                  f"the wizard asks for these settings itself.{C.RESET}")
+            print(f"{C.DIM}Drop --wizard to use flags, or drop the flags to use "
+                  f"the wizard.{C.RESET}")
+            sys.exit(1)
 
     if len(sys.argv) == 1 or '--wizard' in sys.argv:
         prefills = []
