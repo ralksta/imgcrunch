@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Pure sizing/search arithmetic lives in its own module so it can be tested
+# without images. Re-exported here because callers (and tests) use
+# imgcrunch.needs_resize / imgcrunch.calculate_new_size.
+from sizing import calculate_new_size, needs_resize  # noqa: F401
+
 from PIL import Image, ImageOps
 try:
     import piexif
@@ -326,28 +331,6 @@ def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Pat
         output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path
 
-
-
-# ── Core Image Processing ─────────────────────────────────────────────────────
-# NOTE: This function runs in a worker process (ProcessPoolExecutor).
-#       It must be importable at the top level — no lambdas or closures.
-
-def needs_resize(width: int, height: int, max_size: int) -> bool:
-    if max_size == 0:
-        return False
-    return width > max_size or height > max_size
-
-
-def calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]:
-    # Clamp the short side to >=1: extreme aspect ratios (e.g. 100000x30)
-    # can otherwise round to 0 and make Pillow's resize() raise.
-    if width >= height:
-        new_width  = target
-        new_height = max(1, int(height * (target / width)))
-    else:
-        new_height = target
-        new_width  = max(1, int(width * (target / height)))
-    return new_width, new_height
 
 
 def process_image(
