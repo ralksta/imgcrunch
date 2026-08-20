@@ -137,12 +137,13 @@ class JobSettings:
         True when these settings alone rule out a byte-for-byte copy.
 
         This covers only the image-independent reasons. Whether a resize or a
-        mode conversion is needed depends on the actual pixels, so those
-        checks stay in the worker where the file is already open — the
-        byte-copy path requires both this to be False and those checks to
-        pass.
+        mode conversion is needed depends on the actual pixels, and whether a
+        target size is already met depends on the input file's size — both of
+        those checks stay in the worker where the file is already open (and,
+        for the size budget, already stat'ed). The byte-copy path requires
+        this to be False AND all of those image-dependent checks to pass.
         """
-        return bool(self.lossless or self.strip_exif or self.target_bytes)
+        return bool(self.lossless or self.strip_exif)
 
 
 @dataclass
@@ -404,6 +405,17 @@ def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Pat
 
 
 
+# ── Core Image Processing ────────────────────────────────────────────────────
+# NOTE: This function runs in a worker process (ProcessPoolExecutor).
+#       It must be importable at the top level — no lambdas or closures.
+#       The target-size block below nests a closure inside a closure inside
+#       this function (`probe` closes over `img`/`fmt`/`exif_bytes`, `encode`
+#       closes over `frame`/`fmt`/`exif_bytes`) — that is still safe, because
+#       those closures are never pickled. `process_image` itself is pickled
+#       by reference (its module + qualified name) and re-imported fresh in
+#       the worker process; only its arguments — `JobSettings` and the path
+#       strings — actually cross the process boundary.
+
 def process_image(
     input_path_str:  str,
     output_path_str: str,
@@ -496,12 +508,20 @@ def process_image(
                 input_ext == target_ext
                 or (input_ext in ('.jpg', '.jpeg') and target_ext == '.jpg')
             )
+            # A target size never forces a re-encode by itself: if the source
+            # already fits the budget, a byte copy IS the smallest output
+            # that satisfies it, with zero extra generational loss. Only an
+            # oversized source needs the quality/dimension search below.
+            target_ok = (not settings.target_bytes) or (
+                result.input_bytes > 0 and result.input_bytes <= settings.target_bytes
+            )
             # Byte-copy gate: nothing in the settings forces a re-encode AND
             # nothing about this particular image does either. Copy straight
             # through — zero generational loss.
             if already_target and not settings.forces_reencode() \
                     and not needs_resize(width, height, max_size) \
-                    and img.mode in ('RGB', 'L') and not is_animated_gif:
+                    and img.mode in ('RGB', 'L') and not is_animated_gif \
+                    and target_ok:
                 result.skipped  = True
                 result.new_size = (width, height)
                 tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
@@ -845,14 +865,9 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
 
     if format_key != 'original' and not rename_only:
         default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
-        if format_key in ('heic', 'avif') and not HEIF_AVAILABLE:
-            print(f"\n  {C.RED}❌  {format_key.upper()} support requires pillow-heif.{C.RESET}")
-            print(f"      Install with: {C.CYAN}pip install pillow-heif{C.RESET}")
-            return None
-        if format_key == 'jxl' and not JXL_AVAILABLE:
-            print(f"\n  {C.RED}❌  JXL support requires pillow-jxl-plugin.{C.RESET}")
-            print(f"      Install with: {C.CYAN}pip install pillow-jxl-plugin{C.RESET}")
-            return None
+        # Whether the format is actually encodable (not just importable) is
+        # decided by probe_encoder() in main() before the batch starts — no
+        # need to duplicate a weaker import-only check here.
         print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
         default_quality = None
@@ -1323,6 +1338,11 @@ Examples:
             print(f"{C.RED}Error: --target-size needs a real output format — "
                   f"--format original copies files without re-encoding.{C.RESET}")
             sys.exit(1)
+        if rename_only:
+            print(f"{C.RED}Error: --target-size cannot be combined with --rename-only — "
+                  f"rename-only mode does not re-encode, so a byte budget cannot "
+                  f"apply.{C.RESET}")
+            sys.exit(1)
 
     # ── Rename-only: no conversion pipeline at all ───────────────────────────
     if rename_only:
@@ -1416,6 +1436,8 @@ Examples:
         print(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
     if lossless:
         print(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
+    if target_bytes:
+        print(f"  {C.BOLD}Target size:{C.RESET}     {C.CYAN}{format_bytes(target_bytes)} max{C.RESET}")
     if args.max_size == 0:
         print(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
     else:
@@ -1540,6 +1562,8 @@ Examples:
         print(f"  {C.BOLD}{C.CYAN}Dry run{C.RESET} — nothing will be written.\n")
         print(f"  Would process {C.BOLD}{len(tasks)}{C.RESET} image(s), "
               f"{format_bytes(total_in)} of input.")
+        if target_bytes:
+            print(f"  Target size: {C.CYAN}{format_bytes(target_bytes)} max{C.RESET} per output.")
         if stats.duplicates_skipped:
             print(f"  Would skip {stats.duplicates_skipped} duplicate(s).")
         print()

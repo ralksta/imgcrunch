@@ -562,3 +562,101 @@ class TestTargetSize:
             assert img.size[0] < 1600 and img.size[1] < 1200, (
                 f"expected downscale below (1600, 1200), got {img.size}"
             )
+
+    def test_already_under_target_is_copied_not_reencoded(self, tmp_path):
+        """
+        A source that already fits the byte budget must be byte-copied, not
+        pushed back through the quality search — otherwise a modestly
+        compressed JPEG gets re-encoded *upward* toward --quality, growing
+        instead of shrinking. Same format in and out (jpeg -> jpeg) so the
+        byte-copy gate's already_target check passes.
+        """
+        src = tmp_path / "a.jpg"
+        out = tmp_path / "a_out.jpg"
+        Image.new("RGB", (1200, 900), (120, 60, 200)).save(src, quality=30)
+        before = src.read_bytes()
+        assert len(before) < 512_000, "fixture must already fit the budget"
+
+        settings = ic.JobSettings(format_key="jpeg", quality=85, max_size=0,
+                                  target_bytes=512_000)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        assert res.skipped is True
+        assert out.read_bytes() == before
+
+    def test_oversized_source_is_still_crunched(self, tmp_path):
+        """Counterpart to the already-under-target case: an oversized source
+        (same format in/out) must still go through the quality/dimension
+        search rather than being byte-copied over budget."""
+        src = tmp_path / "big.jpg"
+        out = tmp_path / "big_out.jpg"
+        import random
+        img = Image.new("RGB", (1600, 1200))
+        rnd = random.Random(1234)
+        img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                     for _ in range(1600 * 1200)])
+        img.save(src, "JPEG", quality=95)
+        before_size = src.stat().st_size
+        assert before_size > 100_000, "fixture must exceed the budget"
+
+        settings = ic.JobSettings(format_key="jpeg", quality=85, max_size=0,
+                                  target_bytes=40_000)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        assert res.skipped is not True
+        assert out.stat().st_size <= 40_000
+        assert out.stat().st_size < before_size
+
+
+# ── CLI integration: --target-size ───────────────────────────────────────────
+
+class TestTargetSizeCLI:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def _noisy_image(self, path, size=(800, 600)):
+        import random
+        img = Image.new("RGB", size)
+        rnd = random.Random(1234)
+        img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                     for _ in range(size[0] * size[1])])
+        img.save(path)
+
+    def test_target_size_produces_an_under_budget_file(self, tmp_path):
+        self._noisy_image(tmp_path / "noise.png")
+        r = self._run(str(tmp_path), "-f", "jpeg", "--target-size", "50k")
+        assert r.returncode == 0, r.stderr
+
+        outputs = list((tmp_path / "converted").glob("*.jpg"))
+        assert len(outputs) == 1
+        assert outputs[0].stat().st_size <= 50 * 1024  # "50k" == 50 KiB
+
+    def test_target_size_rejects_lossless(self, tmp_path):
+        self._noisy_image(tmp_path / "noise.png")
+        r = self._run(str(tmp_path), "-f", "webp", "--lossless", "--target-size", "50k")
+        assert r.returncode != 0
+        assert "--lossless" in (r.stdout + r.stderr)
+
+    def test_target_size_rejects_format_original(self, tmp_path):
+        self._noisy_image(tmp_path / "noise.png")
+        r = self._run(str(tmp_path), "-f", "original", "--target-size", "50k")
+        assert r.returncode != 0
+        assert "original" in (r.stdout + r.stderr)
+
+    def test_target_size_rejects_unparseable_size(self, tmp_path):
+        self._noisy_image(tmp_path / "noise.png")
+        r = self._run(str(tmp_path), "-f", "jpeg", "--target-size", "not-a-size")
+        assert r.returncode != 0
+        assert "--target-size" in (r.stdout + r.stderr)
+
+    def test_target_size_rejects_rename_only(self, tmp_path):
+        self._noisy_image(tmp_path / "noise.png")
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "p",
+                       "--target-size", "50k")
+        assert r.returncode != 0
+        assert "--rename-only" in (r.stdout + r.stderr)
