@@ -16,6 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import imgcrunch as ic  # noqa: E402
 
+
+def job(format_key="jpeg", quality=85, max_size=3000, **kwargs):
+    """Shorthand for building JobSettings in tests."""
+    return ic.JobSettings(format_key=format_key, quality=quality,
+                          max_size=max_size, **kwargs)
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -123,7 +130,7 @@ class TestProcessImage:
         src = tmp_path / "src.jpg"
         _make_image(src, size=(4000, 2000))
         out = tmp_path / "out.jpg"
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 2000)
+        res = ic.process_image(str(src), str(out), job(max_size=2000))
         assert res.error is None
         assert res.resized is True
         with Image.open(out) as im:
@@ -133,7 +140,7 @@ class TestProcessImage:
         src = tmp_path / "src.png"
         _make_image(src, size=(500, 500))
         out = tmp_path / "out.jpg"
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 3000)
+        res = ic.process_image(str(src), str(out), job())
         assert res.error is None
         assert res.resized is False
         assert out.exists()
@@ -142,7 +149,7 @@ class TestProcessImage:
         src = tmp_path / "src.png"
         _make_image(src, size=(200, 200), color=(0, 255, 0, 128), mode="RGBA")
         out = tmp_path / "out.webp"
-        res = ic.process_image(str(src), str(out), "webp", 82, 3000)
+        res = ic.process_image(str(src), str(out), job("webp", 82))
         assert res.error is None
         with Image.open(out) as im:
             assert im.mode in ("RGBA", "LA")
@@ -151,7 +158,7 @@ class TestProcessImage:
         src = tmp_path / "src.png"
         _make_image(src, size=(200, 200), color=(0, 255, 0, 0), mode="RGBA")
         out = tmp_path / "out.jpg"
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 3000)
+        res = ic.process_image(str(src), str(out), job())
         assert res.error is None
         with Image.open(out) as im:
             assert im.mode == "RGB"
@@ -163,7 +170,7 @@ class TestProcessImage:
         _make_image(src, size=(500, 500))
         out = tmp_path / "converted" / "out.jpg"
         out.parent.mkdir()
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 3000)
+        res = ic.process_image(str(src), str(out), job())
         assert res.error is None
         assert res.skipped is True
         assert out.exists(), "skipped file must still be written to output"
@@ -178,7 +185,7 @@ class TestProcessImage:
         piexif.insert(piexif.dump(exif_dict), str(src))
 
         out = tmp_path / "out.jpg"
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 3000, strip_exif=True)
+        res = ic.process_image(str(src), str(out), job(strip_exif=True))
         assert res.error is None
         with Image.open(out) as im:
             assert "exif" not in im.info or not im.info.get("exif")
@@ -193,7 +200,7 @@ class TestProcessImage:
         piexif.insert(piexif.dump(exif_dict), str(src))
 
         out = tmp_path / "out.jpg"
-        res = ic.process_image(str(src), str(out), "jpeg", 85, 3000, strip_exif=True)
+        res = ic.process_image(str(src), str(out), job(strip_exif=True))
         assert res.error is None
         with Image.open(out) as im:
             assert im.size == (300, 400), "orientation must be baked into pixels"

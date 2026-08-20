@@ -113,6 +113,34 @@ IS_MACOS = sys.platform == 'darwin'
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class JobSettings:
+    """
+    Everything a worker needs to process one image.
+
+    Frozen and primitive-only: every field crosses a process boundary via
+    ProcessPoolExecutor, which pickles its arguments.
+    """
+    format_key:   str
+    quality:      int
+    max_size:     int
+    lossless:     bool = False
+    strip_exif:   bool = False
+    target_bytes: Optional[int] = None
+
+    def forces_reencode(self) -> bool:
+        """
+        True when these settings alone rule out a byte-for-byte copy.
+
+        This covers only the image-independent reasons. Whether a resize or a
+        mode conversion is needed depends on the actual pixels, so those
+        checks stay in the worker where the file is already open — the
+        byte-copy path requires both this to be False and those checks to
+        pass.
+        """
+        return bool(self.lossless or self.strip_exif or self.target_bytes)
+
+
 @dataclass
 class ProcessResult:
     input:          str
@@ -334,14 +362,10 @@ def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Pat
 
 
 def process_image(
-    input_path_str: str,
+    input_path_str:  str,
     output_path_str: str,
-    format_key:  str,
-    quality:     int,
-    max_size:    int,
-    input_bytes: int = 0,
-    lossless:    bool = False,
-    strip_exif:  bool = False,
+    settings:        JobSettings,
+    input_bytes:     int = 0,
 ) -> ProcessResult:
     """
     Process a single image: convert, optionally resize, verify output, atomic write.
@@ -350,6 +374,12 @@ def process_image(
     input_path  = Path(input_path_str)
     output_path = Path(output_path_str)
     input_ext   = input_path.suffix.lower()
+
+    format_key = settings.format_key
+    quality    = settings.quality
+    max_size   = settings.max_size
+    lossless   = settings.lossless
+    strip_exif = settings.strip_exif
 
     result = ProcessResult(
         input=input_path_str,
@@ -423,8 +453,12 @@ def process_image(
                 input_ext == target_ext
                 or (input_ext in ('.jpg', '.jpeg') and target_ext == '.jpg')
             )
-            if already_target and not needs_resize(width, height, max_size) \
-                    and img.mode in ('RGB', 'L') and not lossless and not strip_exif and not is_animated_gif:
+            # Byte-copy gate: nothing in the settings forces a re-encode AND
+            # nothing about this particular image does either. Copy straight
+            # through — zero generational loss.
+            if already_target and not settings.forces_reencode() \
+                    and not needs_resize(width, height, max_size) \
+                    and img.mode in ('RGB', 'L') and not is_animated_gif:
                 result.skipped  = True
                 result.new_size = (width, height)
                 tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
@@ -1423,12 +1457,19 @@ Examples:
 
     # ProcessPoolExecutor for CPU-bound encode/resize (#1)
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        job_settings = JobSettings(
+            format_key=args.format,
+            quality=args.quality,
+            max_size=args.max_size,
+            lossless=lossless,
+            strip_exif=strip,
+        )
+
         future_to_path = {}
         for img_path, output_path, file_size in tasks:
             future = executor.submit(
                 process_image,
-                str(img_path), str(output_path),
-                args.format, args.quality, args.max_size, file_size, lossless, strip,
+                str(img_path), str(output_path), job_settings, file_size,
             )
             future_to_path[future] = img_path
 
