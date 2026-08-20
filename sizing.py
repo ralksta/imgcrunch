@@ -28,3 +28,34 @@ def calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]:
         new_height = target
         new_width  = max(1, int(width * (target / height)))
     return new_width, new_height
+
+
+def search_quality(
+    encode: Callable[[int], bytes],
+    target_bytes: int,
+    lo: int = 1,
+    hi: int = 100,
+) -> Optional[tuple[int, bytes]]:
+    """
+    Binary search the highest quality whose encode still fits target_bytes.
+
+    `encode(quality) -> bytes` is injected so this stays testable without a
+    real encoder. Runs at most 7 encodes (log2(100) is about 6.64), which is
+    what keeps --target-size affordable on a large batch.
+
+    Returns (quality, data), or None when even `lo` overshoots the target.
+    """
+    best: Optional[tuple[int, bytes]] = None
+
+    for _ in range(7):
+        if lo > hi:
+            break
+        mid = (lo + hi) // 2
+        data = encode(mid)
+        if len(data) <= target_bytes:
+            best = (mid, data)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best

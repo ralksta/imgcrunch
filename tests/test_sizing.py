@@ -29,3 +29,38 @@ class TestCalculateNewSize:
     def test_extreme_aspect_ratio_keeps_short_side_at_least_one(self):
         w, h = sizing.calculate_new_size(100000, 30, 3000)
         assert h >= 1
+
+
+class TestSearchQuality:
+    @staticmethod
+    def _linear_encoder(bytes_per_quality: int):
+        """Simulated encoder: output size grows linearly with quality."""
+        return lambda q: b"x" * (q * bytes_per_quality)
+
+    def test_picks_highest_quality_that_fits(self):
+        encode = self._linear_encoder(10)
+        result = sizing.search_quality(encode, 505)
+        assert result is not None
+        quality, data = result
+        assert quality == 50
+        assert len(data) == 500
+
+    def test_returns_none_when_even_lowest_quality_is_too_big(self):
+        encode = self._linear_encoder(10)
+        assert sizing.search_quality(encode, 5) is None
+
+    def test_full_quality_when_everything_fits(self):
+        encode = self._linear_encoder(10)
+        result = sizing.search_quality(encode, 10_000)
+        assert result is not None
+        assert result[0] == 100
+
+    def test_never_exceeds_seven_encodes(self):
+        calls = []
+
+        def encode(q):
+            calls.append(q)
+            return b"x" * (q * 10)
+
+        sizing.search_quality(encode, 505)
+        assert len(calls) <= 7
