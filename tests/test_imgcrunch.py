@@ -445,3 +445,51 @@ class TestProbeEncoder:
         hint = ic.probe_encoder("avif")
         assert hint is not None
         assert "pip install" in hint
+
+
+class TestTargetSize:
+    def _noisy_image(self, path, size=(1600, 1200)):
+        """Random noise so JPEG can't cheat its way under the target."""
+        import random
+        img = Image.new("RGB", size)
+        rnd = random.Random(1234)
+        img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                     for _ in range(size[0] * size[1])])
+        img.save(path)
+
+    def test_output_lands_under_the_target(self, tmp_path):
+        src = tmp_path / "noise.png"
+        out = tmp_path / "noise.jpg"
+        self._noisy_image(src)
+
+        settings = ic.JobSettings(format_key="jpeg", quality=95, max_size=0,
+                                  target_bytes=40_000)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        assert out.stat().st_size <= 40_000
+
+    def test_impossible_target_is_reported_as_an_error(self, tmp_path):
+        src = tmp_path / "noise.png"
+        out = tmp_path / "noise.jpg"
+        self._noisy_image(src, size=(400, 300))
+
+        settings = ic.JobSettings(format_key="jpeg", quality=95, max_size=0,
+                                  target_bytes=1)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is not None
+        assert not out.exists(), "no file may be written when the target is unreachable"
+
+    def test_generous_target_keeps_full_resolution(self, tmp_path):
+        src = tmp_path / "noise.png"
+        out = tmp_path / "noise.jpg"
+        self._noisy_image(src, size=(800, 600))
+
+        settings = ic.JobSettings(format_key="jpeg", quality=95, max_size=0,
+                                  target_bytes=5_000_000)
+        res = ic.process_image(str(src), str(out), settings)
+
+        assert res.error is None
+        with Image.open(out) as img:
+            assert img.size == (800, 600)

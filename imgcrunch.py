@@ -25,7 +25,10 @@ from typing import Optional
 
 # Pure sizing/search arithmetic lives in its own module so it can be tested
 # without images. Re-exported here because callers (and tests) use
-# imgcrunch.needs_resize / imgcrunch.calculate_new_size.
+# imgcrunch.needs_resize / imgcrunch.calculate_new_size. Also imported as a
+# module (below) so the target-size worker path can call sizing.search_quality
+# / sizing.search_scale / sizing.parse_size directly.
+import sizing
 from sizing import calculate_new_size, needs_resize  # noqa: F401
 
 from PIL import Image, ImageOps
@@ -606,6 +609,52 @@ def process_image(
                 else:
                     result.new_size = (width, height)
 
+                # ── Target size: search quality, then dimensions ──────────
+                if settings.target_bytes:
+                    def probe(w, h, _img=img):
+                        frame = _img if (w, h) == _img.size else \
+                            _img.resize((w, h), Image.Resampling.LANCZOS)
+
+                        def encode(q):
+                            buf = io.BytesIO()
+                            kwargs = {**fmt['extra_opts'], 'quality': q}
+                            if exif_bytes:
+                                kwargs['exif'] = exif_bytes
+                            frame.save(buf, fmt['pillow_format'], **kwargs)
+                            return buf.getvalue()
+
+                        hit = sizing.search_quality(encode, settings.target_bytes)
+                        if hit is not None:
+                            return hit[1], len(hit[1])
+                        # Only the no-fit branch needs the floor, so pay for it
+                        # only there.
+                        return None, len(encode(1))
+
+                    cur_w, cur_h = img.size
+                    data = sizing.search_scale(
+                        probe, settings.target_bytes, cur_w, cur_h
+                    )
+                    if data is None:
+                        raise ValueError(
+                            f"cannot reach target size "
+                            f"{format_bytes(settings.target_bytes)}"
+                        )
+
+                    tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+                    try:
+                        tmp_path.write_bytes(data)
+                        with Image.open(tmp_path) as verify_img:
+                            verify_img.verify()
+                        tmp_path.replace(output_path)
+                    except Exception:
+                        tmp_path.unlink(missing_ok=True)
+                        raise
+                    with Image.open(output_path) as final_img:
+                        result.new_size = final_img.size
+                        result.resized = final_img.size != result.original_size
+                    result.output_bytes = output_path.stat().st_size
+                    return result
+
                 # Build save kwargs
                 save_kwargs = {**fmt['extra_opts']}
                 if lossless and format_key in ('avif', 'webp'):
@@ -1157,6 +1206,7 @@ Examples:
   imgcrunch /path/to/images -f heic                  # HEIC with smart quality default
   imgcrunch /path/to/images -f avif --max-size 2000  # AVIF, cap at 2000px
   imgcrunch /path/to/images --lossless -f avif       # lossless AVIF
+  imgcrunch /path/to/images --target-size 500k        # every output under 500 KB
   imgcrunch /path/to/images --skip-dupes             # skip content-identical files
   imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
   imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
@@ -1189,6 +1239,10 @@ Examples:
                                  'no copies). Requires --rename NAME.')
         parser.add_argument('--lossless', action='store_true',
                             help='Lossless encode (AVIF and WebP only)')
+        parser.add_argument('--target-size', type=str, default=None, dest='target_size',
+                            metavar='SIZE',
+                            help='Shrink every output below SIZE (e.g. 500k, 1.5m). '
+                                 'Lowers quality first, then dimensions if needed.')
         parser.add_argument('--skip-dupes', action='store_true',
                             help='Skip files that are content-identical to an already-processed file')
         parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
@@ -1242,6 +1296,23 @@ Examples:
         print(f"{C.DIM}Use --rename-only to rename in-place, or drop --replace to write "
               f"renamed files to converted/.{C.RESET}")
         sys.exit(1)
+
+    target_bytes = None
+    target_size_arg = getattr(args, 'target_size', None)
+    if target_size_arg is not None:
+        try:
+            target_bytes = sizing.parse_size(target_size_arg)
+        except ValueError as exc:
+            print(f"{C.RED}Error: --target-size: {exc}{C.RESET}")
+            sys.exit(1)
+        if lossless:
+            print(f"{C.RED}Error: --target-size cannot be combined with --lossless — "
+                  f"lossless encoding has no quality to trade away.{C.RESET}")
+            sys.exit(1)
+        if args.format == 'original':
+            print(f"{C.RED}Error: --target-size needs a real output format — "
+                  f"--format original copies files without re-encoding.{C.RESET}")
+            sys.exit(1)
 
     # ── Rename-only: no conversion pipeline at all ───────────────────────────
     if rename_only:
@@ -1498,6 +1569,7 @@ Examples:
             max_size=args.max_size,
             lossless=lossless,
             strip_exif=strip,
+            target_bytes=target_bytes,
         )
 
         future_to_path = {}

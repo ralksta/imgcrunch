@@ -273,3 +273,31 @@ class TestSearchScale:
                 assert math.isclose(w / h, ratio, rel_tol=0.15, abs_tol=0.05), (
                     f"source=({width},{height}): ratio distorted at probed ({w},{h})"
                 )
+
+
+import pytest
+
+
+class TestParseSize:
+    def test_plain_number_is_bytes(self):
+        assert sizing.parse_size("250000") == 250_000
+
+    def test_kilobyte_suffix(self):
+        assert sizing.parse_size("500k") == 500 * 1024
+
+    def test_kb_suffix_is_the_same(self):
+        assert sizing.parse_size("500kb") == 500 * 1024
+
+    def test_megabyte_suffix_accepts_decimals(self):
+        assert sizing.parse_size("1.5m") == int(1.5 * 1024 * 1024)
+
+    def test_case_and_whitespace_are_ignored(self):
+        assert sizing.parse_size("  2M ") == 2 * 1024 * 1024
+
+    def test_zero_is_rejected(self):
+        with pytest.raises(ValueError):
+            sizing.parse_size("0")
+
+    def test_garbage_is_rejected(self):
+        with pytest.raises(ValueError):
+            sizing.parse_size("big")

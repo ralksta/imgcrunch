@@ -12,6 +12,35 @@ import math
 from typing import Callable, Optional
 
 
+_SIZE_UNITS = {'': 1, 'b': 1, 'k': 1024, 'kb': 1024,
+               'm': 1024 * 1024, 'mb': 1024 * 1024}
+
+
+def parse_size(text: str) -> int:
+    """
+    Parse a human-written byte budget: "250000", "500k", "800kb", "1.5m".
+
+    Raises ValueError on anything else, including zero and negatives — a
+    target of zero bytes is never what someone meant.
+    """
+    cleaned = str(text).strip().lower()
+    digits = cleaned.rstrip('abkm')
+    unit = cleaned[len(digits):]
+
+    if unit not in _SIZE_UNITS:
+        raise ValueError(f"unknown size unit in {text!r}")
+
+    try:
+        value = float(digits)
+    except ValueError:
+        raise ValueError(f"not a size: {text!r}") from None
+
+    size = int(value * _SIZE_UNITS[unit])
+    if size <= 0:
+        raise ValueError(f"size must be positive, got {text!r}")
+    return size
+
+
 def needs_resize(width: int, height: int, max_size: int) -> bool:
     if max_size == 0:
         return False
