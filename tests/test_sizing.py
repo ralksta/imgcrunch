@@ -64,3 +64,78 @@ class TestSearchQuality:
 
         sizing.search_quality(encode, 505)
         assert len(calls) <= 7
+
+
+class TestSearchScale:
+    @staticmethod
+    def _pixel_probe(fits_at_or_below: int, bytes_per_pixel: float = 1.0):
+        """
+        Simulated probe: an encode fits once the pixel count drops to
+        `fits_at_or_below` or less. `floor` is proportional to pixel count,
+        which is the relationship the real scale estimate assumes.
+        """
+        def probe(w, h):
+            pixels = w * h
+            floor = int(pixels * bytes_per_pixel)
+            if pixels <= fits_at_or_below:
+                return b"x" * floor, floor
+            return None, floor
+        return probe
+
+    def test_returns_immediately_when_full_size_fits(self):
+        calls = []
+
+        def probe(w, h):
+            calls.append((w, h))
+            return b"fits", 4
+
+        result = sizing.search_scale(probe, 1000, 800, 600)
+        assert result == b"fits"
+        assert calls == [(800, 600)]
+
+    def test_scales_down_until_it_fits(self):
+        probe = self._pixel_probe(fits_at_or_below=10_000)
+        result = sizing.search_scale(probe, 10_000, 2000, 2000)
+        assert result is not None
+        assert len(result) <= 10_000
+
+    def test_returns_none_when_nothing_ever_fits(self):
+        def probe(w, h):
+            return None, 10_000_000
+
+        result = sizing.search_scale(probe, 100, 2000, 2000)
+        assert result is None
+
+    def test_terminates_when_dimensions_stagnate(self):
+        calls = []
+
+        def probe(w, h):
+            calls.append((w, h))
+            return None, 10_000_000
+
+        sizing.search_scale(probe, 100, 20, 20, min_edge=16)
+        assert len(calls) <= 17  # one full-size probe + at most max_attempts
+
+    def test_grows_back_when_far_under_target(self):
+        """Landing at 10% of the budget wastes quality — try one size up."""
+        sizes = []
+
+        def probe(w, h):
+            sizes.append((w, h))
+            if w * h <= 100:
+                return b"x" * 100, 100
+            return None, 10_000
+
+        sizing.search_scale(probe, 10_000, 1000, 1000)
+        fitting = [s for s in sizes if s[0] * s[1] <= 100]
+        assert len(sizes) > len(fitting), "should have probed a larger size after the fit"
+
+    def test_never_probes_below_min_edge(self):
+        calls = []
+
+        def probe(w, h):
+            calls.append((w, h))
+            return None, 10_000_000
+
+        sizing.search_scale(probe, 1, 4000, 4000, min_edge=16)
+        assert all(w >= 16 and h >= 16 for w, h in calls)
