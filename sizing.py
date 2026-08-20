@@ -108,8 +108,25 @@ def search_scale(
         else:
             floor_scale = 1.0
         effective_scale = min(1.0, max(scale, floor_scale))
-        w = max(1, int(width * effective_scale))
-        h = max(1, int(height * effective_scale))
+
+        # round(), not int(): width * (min_edge / width) is exactly min_edge
+        # in real-number math, but float division/multiplication can land a
+        # hair under it (e.g. width=49: 49 * (16/49) == 15.999999999999998).
+        # Truncating with int() would then probe min_edge - 1; round() snaps
+        # that back to the true integer value.
+        w = round(width * effective_scale)
+        h = round(height * effective_scale)
+
+        # Belt-and-suspenders clamp: guarantees min_edge (property 1) and
+        # no-upscale (property 3) hold *by construction*, regardless of any
+        # remaining float error, rather than by trusting the arithmetic
+        # above. Deriving both bounds from floor_scale/effective_scale
+        # (the single shared factor) rather than clamping w and h to
+        # independent literal bounds is what keeps property 2 (aspect
+        # ratio) intact — this only nudges an edge that was already within
+        # a rounding hair of its bound, never redistorts the ratio outright.
+        w = max(min(min_edge, width), min(w, width))
+        h = max(min(min_edge, height), min(h, height))
 
         # Integer rounding (or the min_edge floor) can produce the same pixel
         # size twice — without this the loop would spin without progress.

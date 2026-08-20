@@ -230,3 +230,46 @@ class TestSearchScale:
 
         sizing.search_scale(probe, 1, 10, 10, min_edge=16)
         assert all(w <= 10 and h <= 10 for w, h in calls)
+
+    def test_min_edge_floor_never_undershoots_across_many_widths(self):
+        """
+        floor_scale = min_edge / width, multiplied back through
+        effective_scale, is exact in real-number math but not in floating
+        point: for a good fraction of widths, int(width * (min_edge/width))
+        truncates to min_edge - 1 instead of landing on min_edge. Sweep many
+        source widths against a fixed height (rather than a handful of
+        hand-picked ones, which happen to divide cleanly) to catch that,
+        and include (49, 200) explicitly since it's the known reproducer.
+        """
+        min_edge = 16
+        height = 200
+
+        def probe(w, h):
+            return None, 10_000_000  # never fits, forces the min_edge floor
+
+        widths = list(range(1, 400)) + [49]
+
+        for width in widths:
+            calls = []
+
+            def tracking_probe(w, h, _calls=calls):
+                _calls.append((w, h))
+                return probe(w, h)
+
+            sizing.search_scale(tracking_probe, 1, width, height, min_edge=min_edge)
+
+            ratio = width / height
+            for w, h in calls:
+                assert w >= min_edge or w >= width, (
+                    f"source=({width},{height}): probed w={w} is below "
+                    f"min_edge={min_edge} without the source itself being smaller"
+                )
+                assert h >= min_edge or h >= height, (
+                    f"source=({width},{height}): probed h={h} is below "
+                    f"min_edge={min_edge} without the source itself being smaller"
+                )
+                assert w <= width, f"source=({width},{height}): probed w={w} upscales"
+                assert h <= height, f"source=({width},{height}): probed h={h} upscales"
+                assert math.isclose(w / h, ratio, rel_tol=0.15, abs_tol=0.05), (
+                    f"source=({width},{height}): ratio distorted at probed ({w},{h})"
+                )
