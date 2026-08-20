@@ -95,8 +95,21 @@ def search_scale(
     grew = False
 
     for _ in range(max_attempts):
-        w = max(min_edge, int(width * scale))
-        h = max(min_edge, int(height * scale))
+        # Apply one scale factor to both edges together instead of clamping
+        # each edge to min_edge independently: independent clamping can push
+        # the short edge of a wide image up relative to the long edge,
+        # distorting the aspect ratio (calculate_new_size above goes out of
+        # its way to avoid exactly that). floor_scale is the factor at which
+        # the tighter edge would land exactly on min_edge; the outer min(1.0, ...)
+        # additionally guarantees this floor never scales past the source
+        # itself, so a source smaller than min_edge is never upscaled.
+        if width > 0 and height > 0:
+            floor_scale = min(1.0, max(min_edge / width, min_edge / height))
+        else:
+            floor_scale = 1.0
+        effective_scale = min(1.0, max(scale, floor_scale))
+        w = max(1, int(width * effective_scale))
+        h = max(1, int(height * effective_scale))
 
         # Integer rounding (or the min_edge floor) can produce the same pixel
         # size twice — without this the loop would spin without progress.
@@ -122,12 +135,17 @@ def search_scale(
                     continue
             break
 
-        # Still too big. floor_at > target_bytes here (otherwise probe would
-        # have returned a fit), so the factor is always < 1 and the loop
-        # strictly shrinks. The 0.6 cap stops a single wild estimate from
-        # collapsing straight to min_edge.
+        # Still too big. A well-behaved probe implies floor_at > target_bytes
+        # here (otherwise it would have returned a fit), which would make the
+        # sqrt factor < 1 on its own — but the probe contract does not
+        # actually enforce that, so we clamp both ends ourselves rather than
+        # rely on it: 0.95 guarantees scale strictly shrinks every time this
+        # branch runs (even if floor_at == target_bytes, or a contract-
+        # violating probe reports floor_at < target_bytes), and 0.6 stops a
+        # single wild estimate from collapsing straight to min_edge.
         if floor_at > 0:
-            scale = max(scale * max(math.sqrt(target_bytes / floor_at), 0.6), 0.002)
+            multiplier = max(math.sqrt(target_bytes / floor_at), 0.6)
+            scale = max(min(scale * multiplier, scale * 0.95), 0.002)
         else:
             scale = max(scale * 0.6, 0.002)
 
