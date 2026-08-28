@@ -367,14 +367,16 @@ def set_terminal_title(title: str) -> None:
 
 
 def get_input_root(img_path: Path, input_folders: list[Path]) -> Path:
-    """Find which input folder contains the given image path."""
+    """Find which input folder (or parent directory for a single file) contains the given image path."""
     for folder in input_folders:
+        base_dir = folder.parent if folder.is_file() else folder
         try:
-            img_path.relative_to(folder)
-            return folder
+            img_path.relative_to(base_dir)
+            return base_dir
         except ValueError:
             continue
     return img_path.parent
+
 
 
 def get_output_path(input_path: Path, output_dir: Path, input_root: Optional[Path], extension: str,
@@ -1454,7 +1456,8 @@ Examples:
             first_parent = input_paths[0].parent
             output_dir = first_parent / 'merged_images'
         else:
-            output_dir = input_paths[0] / OUTPUT_FOLDER_NAME
+            base_first = input_paths[0].parent if input_paths[0].is_file() else input_paths[0]
+            output_dir = base_first / OUTPUT_FOLDER_NAME
             
         if (args.output or merge_mode) and not dry_run:
             output_dir.mkdir(parents=True, exist_ok=True)

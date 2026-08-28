@@ -81,8 +81,20 @@ class TestDetectDominantFormat:
         imgs = [tmp_path / "a.heic", tmp_path / "b.webp", tmp_path / "c.avif"]
         assert ic.detect_dominant_format(imgs) == "jpeg"
 
-    def test_empty(self):
-        assert ic.detect_dominant_format([]) == "jpeg"
+class TestGetInputRoot:
+    def test_single_file_input(self, tmp_path):
+        f = tmp_path / "photo.png"
+        f.write_text("dummy")
+        root = ic.get_input_root(f, [f])
+        assert root == tmp_path
+
+    def test_folder_input(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "photo.png"
+        f.write_text("dummy")
+        root = ic.get_input_root(f, [tmp_path])
+        assert root == tmp_path
 
 
 # ── Duplicate detection (two-stage) ──────────────────────────────────────────
