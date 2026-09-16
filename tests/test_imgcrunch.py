@@ -2040,3 +2040,139 @@ class TestWorkerCrash:
 
         assert (src / "crash.jpg").exists()
         assert not list(tmp_path.glob("imgcrunch_tmp_*")), "staging dir left behind"
+
+
+# ── Every output format actually encodes and decodes ─────────────────────────
+
+class TestModernFormats:
+    @pytest.mark.parametrize("fmt, plugin, pil_name, keeps_alpha", [
+        ("avif", None,           "AVIF", True),
+        ("heic", "pillow_heif",  "HEIF", False),
+        ("jxl",  "pillow_jxl",   "JXL",  True),
+    ])
+    def test_round_trip(self, tmp_path, fmt, plugin, pil_name, keeps_alpha):
+        if plugin:
+            pytest.importorskip(plugin)
+        if ic.probe_encoder(fmt):
+            pytest.skip(f"{fmt} not encodable here")
+        src = tmp_path / "src.png"
+        _make_image(src, size=(1600, 1000), color=(20, 120, 220, 128), mode="RGBA")
+        out = tmp_path / f"out{ic.FORMAT_CONFIG[fmt]['extension']}"
+
+        res = ic.process_image(str(src), str(out), job(fmt, quality=70, max_size=800))
+
+        assert res.error is None, res.error
+        with Image.open(out) as im:
+            assert im.format == pil_name
+            assert im.size == (800, 500)
+            assert ("A" in im.getbands()) == keeps_alpha
+
+
+# ── Animated GIFs ────────────────────────────────────────────────────────────
+
+class TestAnimatedGif:
+    def _gif(self, path, size=(200, 100), durations=(40, 90, 150)):
+        frames = []
+        for i, _ in enumerate(durations):
+            f = Image.new("RGB", size, (30, 60, 90))
+            f.paste((250, 20 + 60 * i, 20), (10 + 40 * i, 10, 30 + 40 * i, 30))
+            frames.append(f)
+        frames[0].save(path, save_all=True, append_images=frames[1:],
+                       duration=list(durations), loop=2)
+
+    def test_frames_timing_and_loop_survive_webp(self, tmp_path):
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp"))
+
+        assert res.error is None
+        with Image.open(tmp_path / "o.webp") as im:
+            assert im.n_frames == 3
+            durations = []
+            for i in range(im.n_frames):
+                im.seek(i)
+                im.load()           # WebP fills in a frame's duration on load
+                durations.append(im.info.get("duration"))
+            assert durations == [40, 90, 150]
+            assert im.info.get("loop") == 2
+
+    def test_resize_applies_to_every_frame(self, tmp_path):
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", max_size=100))
+
+        assert res.error is None
+        with Image.open(tmp_path / "o.webp") as im:
+            for i in range(im.n_frames):
+                im.seek(i)
+                assert im.size == (100, 50)
+
+    def test_partial_frames_are_not_stretched(self, tmp_path):
+        # GIF encoders store later frames as small patches. If those patches
+        # were resized to the full canvas, the moving square would smear across
+        # the frame; composited correctly it stays a small square.
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", lossless=True))
+
+        with Image.open(tmp_path / "o.webp") as im:
+            im.seek(2)
+            frame = im.convert("RGB")
+            assert frame.getpixel((100, 20))[0] > 200, "the square should sit at x=90..110"
+            assert frame.getpixel((180, 80))[0] < 60, "the background must not be painted over"
+
+
+# ── Folder modes over the real CLI ───────────────────────────────────────────
+
+class TestFolderModes:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_merge_renames_colliding_names(self, tmp_path):
+        for sub, color in (("x", (200, 0, 0)), ("y", (0, 200, 0))):
+            (tmp_path / sub).mkdir()
+            Image.new("RGB", (300, 200), color).save(tmp_path / sub / "a.jpg")
+
+        r = self._run(str(tmp_path / "x"), str(tmp_path / "y"), "-f", "webp",
+                      "--merge", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        merged = sorted(p.name for p in (tmp_path / "merged_images").iterdir())
+        assert merged == ["a.webp", "a_1.webp"]
+
+    def test_skip_dupes_writes_each_content_once(self, tmp_path):
+        Image.new("RGB", (300, 200), (1, 2, 3)).save(tmp_path / "one.jpg")
+        (tmp_path / "copy.jpg").write_bytes((tmp_path / "one.jpg").read_bytes())
+        Image.new("RGB", (300, 200), (9, 9, 9)).save(tmp_path / "other.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--skip-dupes", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert len(list((tmp_path / "converted").glob("*.webp"))) == 2
+        assert "Dupes skipped" in r.stdout
+
+    def test_originals_move_aside_keeping_their_folders(self, tmp_path):
+        (tmp_path / "trip").mkdir()
+        Image.new("RGB", (300, 200)).save(tmp_path / "trip" / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "originals" / "trip" / "a.jpg").exists()
+        assert (tmp_path / "converted" / "trip" / "a.webp").exists()
+        assert not (tmp_path / "trip" / "a.jpg").exists()
+
+    def test_no_move_leaves_originals_alone(self, tmp_path):
+        Image.new("RGB", (300, 200)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "a.jpg").exists()
+        assert not (tmp_path / "originals").exists()
