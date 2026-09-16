@@ -149,6 +149,7 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--dry-run` | | Preview what would be processed without writing anything | off |
 | `--yes` | `-y` | Skip the confirmation prompt for `--replace` and `--rename-only` | off |
 | `--preset NAME` | | Start from a recipe: `web`, `archive`, `compact`, or `last` (the settings of your previous run). Flags you type explicitly still win; a preset's byte budget quietly steps aside for `--lossless`, `-f original` or `--rename-only`. | off |
+| `--workers N` | | Number of parallel encoder processes. Lower it to keep the machine responsive during a big batch. | one per core |
 | `--quiet` | | Print only errors — no config table, progress bar or summary | off |
 | `--args-file` | | *Internal.* Reads one argument per line from a file, then deletes it. The macOS Quick Action uses this to hand over a Finder selection. | off |
 

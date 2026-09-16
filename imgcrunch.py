@@ -1538,6 +1538,16 @@ def rename_in_place(images: list[Path], rename_base: str, dry_run: bool = False)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
     The CLI's argument definitions, in one place a test can reach.
@@ -1623,6 +1633,9 @@ Examples:
                         help='Start from a saved recipe: '
                              + ', '.join(['last', *presets.BUILTIN_PRESETS])
                              + '. Flags given explicitly still win.')
+    parser.add_argument('--workers', type=_positive_int, default=None, metavar='N',
+                        help=f'Parallel encoder processes (default: one per core, '
+                             f'{MAX_WORKERS} here). Lower it to keep the machine usable.')
     parser.add_argument('--quiet', action='store_true',
                         help='Print only errors — no config table, progress '
                              'bar or summary')
@@ -1782,6 +1795,7 @@ def main():
             sys.exit(1)
 
     assume_yes = getattr(args, 'yes', False)
+    workers    = getattr(args, 'workers', None) or MAX_WORKERS
     quiet      = getattr(args, 'quiet', False)
 
     def info(*a, **kw):
@@ -1911,7 +1925,7 @@ def main():
         info(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
     if post_hook:
         info(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
-    info(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
+    info(f"  {C.BOLD}Workers:{C.RESET}         {workers}")
     if not replace_mode and not args.no_move and not merge_mode:
         info(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
     info(f"{C.DIM}{'─' * 60}{C.RESET}")
@@ -2080,7 +2094,7 @@ def main():
     interrupted = False
 
     # ProcessPoolExecutor for CPU-bound encode/resize (#1)
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         job_settings = JobSettings(
             format_key=args.format,
             quality=args.quality,

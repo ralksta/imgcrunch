@@ -1911,3 +1911,28 @@ class TestNestedOutputLayout:
         assert r.returncode == 0, r.stdout + r.stderr
         assert (tmp_path / "converted" / "x" / "p.webp").exists()
         assert (tmp_path / "converted" / "y" / "z" / "p.webp").exists()
+
+
+class TestWorkersFlag:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_limits_the_pool(self, tmp_path):
+        Image.new("RGB", (600, 400)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move", "--workers", "2")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Workers:         2" in r.stdout
+
+    def test_zero_is_rejected(self, tmp_path):
+        r = self._run(str(tmp_path), "--workers", "0")
+
+        assert r.returncode != 0
+        assert "at least 1" in r.stderr, "an unknown-flag error would also mention --workers"
+
+    def test_default_is_one_per_core(self):
+        assert ic.parse_cli(["x"]).workers is None     # resolved to MAX_WORKERS in main()
