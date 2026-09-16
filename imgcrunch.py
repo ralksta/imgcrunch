@@ -167,12 +167,19 @@ class BatchStats:
     processed:          int   = 0
     resized:            int   = 0
     errors:             int   = 0
+    # Failures *after* a successful encode - a replace, a move or a post-hook
+    # that blew up. Kept apart from `errors` because the output does exist for
+    # these; it is the step afterwards that did not happen.
+    post_errors:        int   = 0
     moved:              int   = 0
     replaced:           int   = 0
     skipped:            int   = 0
     duplicates_skipped: int   = 0
     total_input_bytes:  int   = 0
     total_output_bytes: int   = 0
+    # (filename, reason) for every failure, so the summary can name them
+    # instead of only counting them.
+    failures: list = field(default_factory=list)
     # per source-format counters  {'.jpg': {'count': N, 'in': bytes, 'out': bytes}}
     by_format: dict = field(default_factory=lambda: defaultdict(lambda: {'count': 0, 'in': 0, 'out': 0}))
 
@@ -344,19 +351,15 @@ def refresh_quicklook(paths: list[Path]) -> None:
     """Tell macOS Quick Look to regenerate thumbnails for the given files."""
     if not IS_MACOS or not paths:
         return
-    try:
-        subprocess.run(
-            ['qlmanage', '-r', 'cache'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-        # Touch each output file so Finder notices the change
-        for p in paths:
+    # Touching each output is enough for Finder to notice it. The old code also
+    # ran `qlmanage -r cache`, which throws away the Quick Look thumbnails for
+    # every file on the machine - a system-wide cost for a per-file problem.
+    for p in paths:
+        try:
             if p.exists():
                 p.touch()
-    except Exception:
-        pass
+        except OSError:
+            pass
 
 
 def set_terminal_title(title: str) -> None:
@@ -551,8 +554,13 @@ def process_image(
                     elif use_piexif and input_ext in ('.jpg', '.jpeg', '.tiff', '.tif'):
                         exif_dict  = piexif.load(str(input_path))
                         exif_bytes = piexif.dump(exif_dict)
-                except Exception:
-                    exif_dict = None
+                except Exception as exc:
+                    # Losing the metadata silently means the user finds out
+                    # months later that the timestamps are gone.
+                    exif_dict  = None
+                    exif_bytes = None
+                    result.warning = (f"EXIF metadata could not be read "
+                                      f"({exc}); saved without it")
 
             # Handle Animation (GIF/etc -> WebP/AVIF)
             is_animated = is_animated_gif and format_key in ('webp', 'avif')
@@ -1031,6 +1039,8 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             'post_hook':     None,
             'merge':         False,
             'strip':         False,
+            'yes':           True,
+            'quiet':         False,
         }
 
     if merge_mode:
@@ -1058,8 +1068,16 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.RED}{C.BOLD}⚠️  WARNING: This will permanently replace your original files!{C.RESET}")
 
     print()
-    confirm = input(f"  Start processing? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
-    if confirm and confirm not in ('y', 'yes'):
+    # Replace has no undo, so Enter must not be the button that triggers it.
+    # Every other mode keeps its friendly default.
+    if replace_mode:
+        prompt  = f"  Start processing? (y/{C.GREEN}N{C.RESET}): "
+        started = input(prompt).strip().lower() in ('y', 'yes')
+    else:
+        prompt  = f"  Start processing? ({C.GREEN}Y{C.RESET}/n): "
+        confirm = input(prompt).strip().lower()
+        started = not confirm or confirm in ('y', 'yes')
+    if not started:
         print()
         print(f"  {C.DIM}No worries — nothing was changed.{C.RESET}")
         print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
@@ -1082,6 +1100,8 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'post_hook':     None,
         'merge':         merge_mode,
         'strip':         strip_mode,
+        'yes':           True,
+        'quiet':         False,
     }
 
 
@@ -1097,6 +1117,9 @@ def print_summary(stats: BatchStats, elapsed: float, output_dir: Path):
     print(f"  {C.BOLD}Images resized:{C.RESET}    {C.CYAN}{stats.resized}{C.RESET}")
     if stats.errors > 0:
         print(f"  {C.BOLD}Errors:{C.RESET}            {C.RED}{stats.errors}{C.RESET}")
+    if stats.post_errors > 0:
+        print(f"  {C.BOLD}Failed after encode:{C.RESET} {C.RED}{stats.post_errors}{C.RESET}"
+              f"  {C.DIM}(replace / move / post-hook){C.RESET}")
     if stats.skipped > 0:
         print(f"  {C.BOLD}Skipped (no-op):{C.RESET}   {C.DIM}{stats.skipped}{C.RESET}")
     if stats.duplicates_skipped > 0:
@@ -1145,6 +1168,136 @@ def print_summary(stats: BatchStats, elapsed: float, output_dir: Path):
 
     if stats.errors > 0:
         print(f"\n  {C.YELLOW}⚠️  {stats.errors} file(s) had errors and remain in the input folder{C.RESET}")
+    if stats.post_errors > 0:
+        print(f"  {C.YELLOW}⚠️  {stats.post_errors} file(s) were converted but could not be "
+              f"moved or replaced afterwards{C.RESET}")
+
+    if stats.failures:
+        print()
+        print(f"  {C.BOLD}What failed:{C.RESET}")
+        for name, reason in stats.failures[:10]:
+            print(f"    {C.RED}✗{C.RESET} {name}  {C.DIM}{reason}{C.RESET}")
+        if len(stats.failures) > 10:
+            print(f"    {C.DIM}… and {len(stats.failures) - 10} more{C.RESET}")
+
+
+# Worker failures arrive as raw exception text from Pillow and its plugins.
+# Some of it is fine to show; some of it ("cannot identify image file") tells
+# the reader nothing about what to do next.
+_ERROR_TRANSLATIONS = (
+    ('cannot identify image file',
+     'not readable as an image \u2014 damaged, or the extension lies about the format'),
+    ('truncated', 'the file is truncated \u2014 it was probably copied while still being written'),
+    ('encoder error', 'the encoder refused this image \u2014 the dimensions may be extreme'),
+    ('broken data stream', 'the image data is corrupt'),
+)
+
+
+def humanize_error(message: str) -> str:
+    """Turn an encoder's exception text into something actionable, or leave it."""
+    low = message.lower()
+    for needle, replacement in _ERROR_TRANSLATIONS:
+        if needle in low:
+            return replacement
+    return message
+
+
+def confirm_destructive(what: str, assume_yes: bool) -> bool:
+    """
+    Get consent before an irreversible run, or refuse to guess.
+
+    --replace and --rename-only cannot be undone. On a terminal we ask. In a
+    script there is nobody to ask, so the run stops instead of shredding files
+    on the strength of a flag that may have been pasted by accident; --yes is
+    how a script says it meant it.
+    """
+    if assume_yes:
+        return True
+
+    if not sys.stdin.isatty():
+        print(f"{C.RED}Error: {what} cannot be undone, and there is no terminal "
+              f"to confirm on.{C.RESET}")
+        print(f"{C.DIM}Re-run with --yes if that is really what you want.{C.RESET}")
+        return False
+
+    print()
+    print(f"  {C.YELLOW}\u26a0\ufe0f  {what} \u2014 this cannot be undone.{C.RESET}")
+    answer = input(f"  Continue? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+    return answer in ('y', 'yes')
+
+
+def cancellation_notice(stats: BatchStats, total: int) -> str:
+    """
+    Describe what a cancelled run left behind.
+
+    The old handler said "nothing was changed" no matter how far the batch had
+    got, which is false the moment a single original has been replaced or moved
+    away. Anything already done has to be named, because that is exactly what
+    someone hitting Ctrl+C needs to know.
+    """
+    done = stats.processed
+    if done == 0 and stats.replaced == 0 and stats.moved == 0:
+        return "Cancelled \u2014 nothing was changed."
+
+    parts = [f"Cancelled after {done} of {total} images."]
+    if stats.replaced:
+        parts.append(f"{stats.replaced} original(s) were already replaced.")
+    if stats.moved:
+        parts.append(f"{stats.moved} original(s) were already moved to originals/.")
+    if not stats.replaced and not stats.moved:
+        parts.append("Outputs written so far were kept; the originals are untouched.")
+    # Cancelling stops handing out work; it does not stop the workers already
+    # running. They finish the image they are on, so the output folder can hold
+    # more files than the count above - saying otherwise would be the same kind
+    # of lie this function exists to fix.
+    parts.append("Workers already running finished their current image, so a few "
+                 "more outputs may exist.")
+    return " ".join(parts)
+
+
+def make_staging_dir(input_paths: list[Path]) -> Path:
+    """
+    Create the temp dir that --replace stages its outputs in.
+
+    It goes next to the input on purpose. The default mkdtemp() lands under
+    /var/folders on the system volume, so replacing images on an external disk
+    turns every move into a full copy across the volume boundary — serial, in
+    the main thread, and long enough to matter. Next to the input it is a
+    rename instead.
+
+    Falls back to the system temp dir when the input's parent is not writable,
+    because a slow replace still beats no replace at all.
+    """
+    try:
+        return Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_',
+                                     dir=input_paths[0].parent))
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_'))
+
+
+def replace_original(input_path: Path, staged_path: Path, final_ext: str) -> Path:
+    """
+    Move a staged output over its original and return the final path.
+
+    The original is removed only *after* the replacement is safely in place.
+    Doing it the other way round — unlink first, then move — destroys the image
+    whenever the move fails, and it fails for ordinary reasons: a full disk, a
+    read-only parent, a vanished volume. On a format change the final path is a
+    *different* file from the original, so there is nothing to fall back on.
+
+    os.replace is atomic while both sides share a volume, which they do because
+    main() stages next to the input. The shutil.move fallback covers the case
+    where they don't; it is not atomic, but it still never removes the original
+    before the replacement exists.
+    """
+    final_path = input_path.with_suffix(final_ext)
+    try:
+        os.replace(staged_path, final_path)
+    except OSError:
+        shutil.move(str(staged_path), str(final_path))
+    if final_path != input_path:
+        input_path.unlink(missing_ok=True)
+    return final_path
 
 
 def move_to_originals(input_path: Path, originals_dir: Path, input_root: Path) -> Path:
@@ -1227,22 +1380,28 @@ def rename_in_place(images: list[Path], rename_base: str, dry_run: bool = False)
 def main():
     # Expand --args-file if present
     if '--args-file' in sys.argv:
+        # The macOS Quick Action hands the Finder selection over this way, one
+        # argument per line. A failure here used to print a note and carry on
+        # with --args-file still in argv, which then tripped the stray-flag
+        # check below and blamed --wizard for it. Say what actually broke.
+        idx = sys.argv.index('--args-file')
+        if idx + 1 >= len(sys.argv):
+            print(f"{C.RED}Error: --args-file needs a path.{C.RESET}")
+            sys.exit(2)
+        args_file_path = sys.argv[idx + 1]
         try:
-            idx = sys.argv.index('--args-file')
-            args_file_path = sys.argv[idx + 1]
-            expanded_args = []
             with open(args_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.rstrip('\r\n')
-                    if line:
-                        expanded_args.append(line)
-            try:
-                os.unlink(args_file_path)
-            except OSError:
-                pass
-            sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
-        except Exception as e:
-            print(f"Error expanding args file: {e}")
+                expanded_args = [line.rstrip('\r\n') for line in f
+                                 if line.rstrip('\r\n')]
+        except OSError as e:
+            print(f"{C.RED}Error: cannot read --args-file "
+                  f"{args_file_path}: {e}{C.RESET}")
+            sys.exit(2)
+        try:
+            os.unlink(args_file_path)
+        except OSError:
+            pass
+        sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
 
     if '--wizard' in sys.argv:
         # Everything else on the line becomes a path prefill for the wizard, and
@@ -1332,6 +1491,12 @@ Examples:
                             help='Merge all input folders/files into a single output folder')
         parser.add_argument('--dry-run', action='store_true', dest='dry_run',
                             help='Show what would be processed without writing anything')
+        parser.add_argument('--quiet', action='store_true',
+                            help='Print only errors — no config table, progress '
+                                 'bar or summary')
+        parser.add_argument('-y', '--yes', action='store_true',
+                            help='Skip the confirmation prompt for --replace '
+                                 'and --rename-only')
         args = parser.parse_args()
 
     # Resolve quality
@@ -1397,8 +1562,28 @@ Examples:
                   f"apply.{C.RESET}")
             sys.exit(1)
 
+    assume_yes = getattr(args, 'yes', False)
+    quiet      = getattr(args, 'quiet', False)
+
+    def info(*a, **kw):
+        """Chatter: config table, counts, summary. Silenced by --quiet."""
+        if not quiet:
+            print(*a, **kw)
+
+    def note(msg):
+        """Per-file progress. Chatter too, and routed around the progress bar."""
+        if not quiet:
+            alert(msg)
+
+    def alert(msg):
+        """Errors and warnings. --quiet is about noise, not about hiding these."""
+        (tqdm.write if progress else print)(msg)
+
     # ── Rename-only: no conversion pipeline at all ───────────────────────────
     if rename_only:
+        if not dry_run and not confirm_destructive(
+                f"Renaming every image in place as {rename_base}_###", assume_yes):
+            sys.exit(1)
         print()
         print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}✏️  Rename only (in-place){C.RESET}")
         print(f"  {C.BOLD}Input path(s):{C.RESET}")
@@ -1446,7 +1631,10 @@ Examples:
             sys.exit(1)
 
     if replace_mode:
-        tmp_dir      = Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_'))
+        if not dry_run and not confirm_destructive(
+                "Replacing the original files in place", assume_yes):
+            sys.exit(1)
+        tmp_dir      = make_staging_dir(input_paths)
         output_dir   = tmp_dir
         originals_dir = None
     else:
@@ -1463,51 +1651,51 @@ Examples:
             output_dir.mkdir(parents=True, exist_ok=True)
 
     # Print run config
-    print()
+    info()
     if replace_mode:
-        print(f"  {C.BOLD}Mode:{C.RESET}            {C.YELLOW}⚠️  Replace in-place{C.RESET}")
+        info(f"  {C.BOLD}Mode:{C.RESET}            {C.YELLOW}⚠️  Replace in-place{C.RESET}")
     elif merge_mode:
-        print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}📂  Merge inputs{C.RESET}")
+        info(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}📂  Merge inputs{C.RESET}")
     else:
-        print(f"  {C.BOLD}Mode:{C.RESET}            📂  Keep originals")
+        info(f"  {C.BOLD}Mode:{C.RESET}            📂  Keep originals")
         
-    print(f"  {C.BOLD}Input path(s):{C.RESET}")
+    info(f"  {C.BOLD}Input path(s):{C.RESET}")
     for p in input_paths:
-        print(f"    {p}")
+        info(f"    {p}")
         
     if not replace_mode:
         if args.output or merge_mode:
-            print(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
+            info(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
         else:
-            print(f"  {C.BOLD}Output folder:{C.RESET}   <each_source_folder>/converted/")
+            info(f"  {C.BOLD}Output folder:{C.RESET}   <each_source_folder>/converted/")
             
     if args.format == 'original':
-        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}ORIGINAL (copy-only){C.RESET}")
+        info(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}ORIGINAL (copy-only){C.RESET}")
     else:
-        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
+        info(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
         
     if args.quality:
-        print(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
+        info(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
     if lossless:
-        print(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
+        info(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
     if target_bytes:
-        print(f"  {C.BOLD}Target size:{C.RESET}     {C.CYAN}{format_bytes(target_bytes)} max{C.RESET}")
+        info(f"  {C.BOLD}Target size:{C.RESET}     {C.CYAN}{format_bytes(target_bytes)} max{C.RESET}")
     if args.max_size == 0:
-        print(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
+        info(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
     else:
-        print(f"  {C.BOLD}Max size:{C.RESET}        {args.max_size}px longest side")
+        info(f"  {C.BOLD}Max size:{C.RESET}        {args.max_size}px longest side")
     if rename_base:
-        print(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
+        info(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
     if skip_dupes:
-        print(f"  {C.BOLD}Skip dupes:{C.RESET}      {C.CYAN}yes (content hash){C.RESET}")
+        info(f"  {C.BOLD}Skip dupes:{C.RESET}      {C.CYAN}yes (content hash){C.RESET}")
     if strip:
-        print(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
+        info(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
     if post_hook:
-        print(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
-    print(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
+        info(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
+    info(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
     if not replace_mode and not args.no_move and not merge_mode:
-        print(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
-    print(f"{C.DIM}{'─' * 60}{C.RESET}")
+        info(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
+    info(f"{C.DIM}{'─' * 60}{C.RESET}")
 
     # Find images
     all_images_with_sizes = find_images_from_paths(input_paths)
@@ -1533,7 +1721,7 @@ Examples:
             images_with_sizes.append((img, sz))
 
     if not images_with_sizes:
-        print(f"{C.YELLOW}No images found!{C.RESET}")
+        info(f"{C.YELLOW}No images found!{C.RESET}")
         if replace_mode:
             tmp_dir.rmdir()
         sys.exit(0)
@@ -1541,7 +1729,7 @@ Examples:
     # Disk space preflight (#13)
     disk_err = preflight_disk_check(images_with_sizes, output_dir)
     if disk_err:
-        print(f"\n  {C.RED}❌  {disk_err}{C.RESET}\n")
+        info(f"\n  {C.RED}❌  {disk_err}{C.RESET}\n")
         if replace_mode:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.exit(1)
@@ -1552,11 +1740,11 @@ Examples:
     # Duplicate detection (#14)
     dupe_paths: set[str] = set()
     if skip_dupes:
-        print(f"  {C.DIM}Hashing files for duplicate detection...{C.RESET}", end='', flush=True)
+        info(f"  {C.DIM}Hashing files for duplicate detection...{C.RESET}", end='', flush=True)
         dupe_paths = build_duplicate_set(images)
-        print(f"\r  {C.DIM}Found {len(dupe_paths)} duplicate(s) to skip{C.RESET}          ")
+        info(f"\r  {C.DIM}Found {len(dupe_paths)} duplicate(s) to skip{C.RESET}          ")
 
-    print(f"  Found {C.BOLD}{len(images)}{C.RESET} images  "
+    info(f"  Found {C.BOLD}{len(images)}{C.RESET} images  "
           f"{f'({len(dupe_paths)} dupes will be skipped)' if dupe_paths else ''}\n")
 
     stats = BatchStats()
@@ -1633,7 +1821,7 @@ Examples:
 
     start_time = time.time()
 
-    if TQDM_AVAILABLE:
+    if TQDM_AVAILABLE and not quiet:
         progress = tqdm(
             total=len(tasks),
             desc=f"  {C.CYAN}Processing{C.RESET}",
@@ -1648,6 +1836,7 @@ Examples:
         progress = None
 
     output_paths_written: list[Path] = []
+    interrupted = False
 
     # ProcessPoolExecutor for CPU-bound encode/resize (#1)
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1669,92 +1858,130 @@ Examples:
             future_to_path[future] = img_path
 
         completed_tasks = 0
-        for future in as_completed(future_to_path):
-            completed_tasks += 1
-            img_path = future_to_path[future]
-            pct = int(completed_tasks / len(tasks) * 100)
-            set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
+        try:
+            for future in as_completed(future_to_path):
+                completed_tasks += 1
+                img_path = future_to_path[future]
+                pct = int(completed_tasks / len(tasks) * 100)
+                set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
             
-            result: ProcessResult = future.result()
+                result: ProcessResult = future.result()
 
-            if result.error:
-                msg = f"  {C.RED}✗{C.RESET} {img_path.name}: {result.error}"
-                (tqdm.write if progress else print)(msg)
-                stats.errors += 1
+                if result.error:
+                    reason = humanize_error(result.error)
+                    msg = f"  {C.RED}✗{C.RESET} {img_path.name}: {reason}"
+                    alert(msg)
+                    stats.errors += 1
+                    stats.failures.append((img_path.name, reason))
 
-            else:
-                stats.processed          += 1
-                if result.skipped:
-                    # Already-optimal file: copied through untouched, but it
-                    # still gets moved/replaced like any other output.
-                    stats.skipped += 1
-                stats.total_input_bytes  += result.input_bytes
-                stats.total_output_bytes += result.output_bytes
+                else:
+                    stats.processed          += 1
+                    if result.skipped:
+                        # Already-optimal file: copied through untouched, but it
+                        # still gets moved/replaced like any other output.
+                        stats.skipped += 1
+                    stats.total_input_bytes  += result.input_bytes
+                    stats.total_output_bytes += result.output_bytes
 
-                # Per-format breakdown accumulation (#20)
-                fdata = stats.by_format[result.input_format]
-                fdata['count'] += 1
-                fdata['in']    += result.input_bytes
-                fdata['out']   += result.output_bytes
+                    # Per-format breakdown accumulation (#20)
+                    fdata = stats.by_format[result.input_format]
+                    fdata['count'] += 1
+                    fdata['in']    += result.input_bytes
+                    fdata['out']   += result.output_bytes
 
-                if result.resized:
-                    stats.resized += 1
-                    orig = result.original_size
-                    new  = result.new_size
-                    msg  = (
-                        f"  {C.GREEN}✓{C.RESET} {C.DIM}Resized{C.RESET} {img_path.name} "
-                        f"{C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
-                    )
-                    (tqdm.write if progress else print)(msg)
+                    if result.resized:
+                        stats.resized += 1
+                        orig = result.original_size
+                        new  = result.new_size
+                        msg  = (
+                            f"  {C.GREEN}✓{C.RESET} {C.DIM}Resized{C.RESET} {img_path.name} "
+                            f"{C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
+                        )
+                        note(msg)
 
-                if result.warning:
-                    warn = f"  {C.YELLOW}⚠ {img_path.name}: {result.warning}{C.RESET}"
-                    (tqdm.write if progress else print)(warn)
+                    if result.warning:
+                        warn = f"  {C.YELLOW}⚠ {img_path.name}: {result.warning}{C.RESET}"
+                        alert(warn)
 
-                output_path = Path(result.output)
-                output_paths_written.append(output_path)
+                    output_path = Path(result.output)
+                    output_paths_written.append(output_path)
+
+                    if progress:
+                        progress.set_postfix_str(img_path.name[-30:], refresh=False)
+
+                    # Post-hook (#18) — shell-quote paths to avoid injection/breakage
+                    if post_hook:
+                        cmd = (post_hook
+                               .replace('{in}', shlex.quote(str(img_path)))
+                               .replace('{out}', shlex.quote(str(output_path))))
+                        try:
+                            # stderr is captured, not discarded: a hook that exits
+                            # non-zero used to vanish without a trace, so a broken
+                            # hook looked exactly like a working one.
+                            hook = subprocess.run(cmd, shell=True, timeout=30,
+                                                  stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.PIPE, text=True)
+                            if hook.returncode != 0:
+                                lines = (hook.stderr or '').strip().splitlines()
+                                detail = f" — {lines[0]}" if lines else ""
+                                warn = (f"  {C.YELLOW}⚠ post-hook exited with "
+                                        f"{hook.returncode} for {img_path.name}"
+                                        f"{detail}{C.RESET}")
+                                alert(warn)
+                                stats.post_errors += 1
+                        except Exception as hook_err:
+                            warn = (f"  {C.YELLOW}⚠ post-hook failed for "
+                                    f"{img_path.name}: {hook_err}{C.RESET}")
+                            alert(warn)
+                            stats.post_errors += 1
+
+                    if replace_mode:
+                        try:
+                            final_ext = (img_path.suffix if args.format == 'original'
+                                         else fmt['extension'])
+                            replace_original(img_path, Path(result.output), final_ext)
+                            stats.replaced += 1
+                        except Exception as e:
+                            msg = (f"  {C.RED}✗{C.RESET} {img_path.name}: "
+                                   f"could not replace original: {e}")
+                            alert(msg)
+                            stats.post_errors += 1
+                            stats.failures.append(
+                                (img_path.name, f"could not replace original: {e}"))
+                    elif not args.no_move:
+                        try:
+                            input_root = get_input_root(img_path, input_paths)
+                            specific_originals_dir = input_root / 'originals'
+                            move_to_originals(img_path, specific_originals_dir, input_root)
+                            stats.moved += 1
+                        except Exception as e:
+                            warn = (f"  {C.YELLOW}⚠ Could not move {img_path.name} "
+                                    f"to originals/: {e}{C.RESET}")
+                            alert(warn)
+                            stats.post_errors += 1
+                            stats.failures.append(
+                                (img_path.name, f"could not move to originals/: {e}"))
 
                 if progress:
-                    progress.set_postfix_str(img_path.name[-30:], refresh=False)
-
-                # Post-hook (#18) — shell-quote paths to avoid injection/breakage
-                if post_hook:
-                    cmd = (post_hook
-                           .replace('{in}', shlex.quote(str(img_path)))
-                           .replace('{out}', shlex.quote(str(output_path))))
-                    try:
-                        subprocess.run(cmd, shell=True, timeout=30,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception as hook_err:
-                        warn = f"  {C.YELLOW}⚠ post-hook failed for {img_path.name}: {hook_err}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-
-                if replace_mode:
-                    try:
-                        converted_path = Path(result.output)
-                        final_ext = img_path.suffix if args.format == 'original' else fmt['extension']
-                        final_path     = img_path.with_suffix(final_ext)
-                        img_path.unlink()
-                        shutil.move(str(converted_path), str(final_path))
-                        stats.replaced += 1
-                    except Exception as e:
-                        warn = f"  {C.YELLOW}⚠ Could not replace {img_path.name}: {e}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-                elif not args.no_move:
-                    try:
-                        input_root = get_input_root(img_path, input_paths)
-                        specific_originals_dir = input_root / 'originals'
-                        move_to_originals(img_path, specific_originals_dir, input_root)
-                        stats.moved += 1
-                    except Exception as e:
-                        warn = f"  {C.YELLOW}⚠ Could not move {img_path.name}: {e}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-
-            if progress:
-                progress.update(1)
+                    progress.update(1)
+        except KeyboardInterrupt:
+            # Stop handing out work and stop waiting for what is still running.
+            # Workers finish the image they are on; nothing new starts.
+            interrupted = True
+            executor.shutdown(wait=False, cancel_futures=True)
 
     if progress:
         progress.close()
+
+    if interrupted:
+        if replace_mode:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        print()
+        print(f"  {C.DIM}{cancellation_notice(stats, len(tasks))}{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you're ready. \U0001f44b{C.RESET}")
+        print()
+        set_terminal_title("[ImgCrunch] Cancelled")
+        sys.exit(130)
 
     set_terminal_title("[ImgCrunch] Done")
 
@@ -1766,6 +1993,11 @@ Examples:
     # macOS Quick Look refresh (#22)
     if IS_MACOS and output_paths_written:
         refresh_quicklook(output_paths_written)
+
+    if quiet:
+        # Nothing went wrong worth interrupting a script for, so say nothing.
+        # Individual failures were already printed as they happened.
+        return
 
     print_summary(stats, elapsed, output_dir)
     if replace_mode:

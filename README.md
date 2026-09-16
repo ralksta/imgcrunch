@@ -17,9 +17,9 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 
 ### 🚀 High-Speed Performance
 - **True Parallelism**: CPU-intensive resizing and encoding run in parallel across all available CPU cores using Python's `ProcessPoolExecutor`.
-- **mmap-Accelerated Reads**: Memory-mapped file I/O for faster reading of large source images.
+- **mmap-Accelerated Hashing**: Duplicate detection memory-maps files instead of reading them in chunks.
 - **Smart Skipping**: Automatically skips images that are already in the target format and do not exceed the maximum dimension.
-- **Duplicate Detection**: Hashes files using MD5 and skips content-identical duplicates automatically.
+- **Duplicate Detection (`--skip-dupes`)**: Groups by file size first and hashes only the collisions, then skips content-identical duplicates. Off unless you ask for it.
 
 ### 🍎 macOS Integration
 - **Finder Quick Action**: Select images and folders directly in Finder, right-click → *Quick Actions* → *ImgCrunch*. Immediately starts the interactive wizard.
@@ -28,7 +28,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 
 ### 🛡️ Privacy & Safety
 - **Privacy Mode (`--strip` / `--no-exif`)**: Strips all EXIF metadata (GPS coordinates, camera model, etc.) completely before saving.
-- **Atomic Writes**: Writes to a temporary file first and renames it only after successful output verification. Prevents corrupted outputs.
+- **Atomic Writes**: Writes to a temporary file first and renames it only after successful output verification. `--replace` stages next to the source and moves the result into place *before* dropping the original, so a failed write never costs you the file.
 - **Preflight Disk Check**: Estimates required disk space before processing starts and aborts if the disk is at risk of running full.
 - **Encoder Preflight**: Verifies the output format can actually be encoded on this machine before the batch starts — a missing AVIF or JXL encoder fails immediately with an install hint instead of on image 200.
 
@@ -132,6 +132,9 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--post-hook CMD`| | Shell command to run after each file (placeholders: `{in}`, `{out}`) | off |
 | `--skip-dupes` | | Skip files that are content-identical to an already-processed file | off |
 | `--dry-run` | | Preview what would be processed without writing anything | off |
+| `--yes` | `-y` | Skip the confirmation prompt for `--replace` and `--rename-only` | off |
+| `--quiet` | | Print only errors — no config table, progress bar or summary | off |
+| `--args-file` | | *Internal.* Reads one argument per line from a file, then deletes it. The macOS Quick Action uses this to hand over a Finder selection. | off |
 
 ---
 
@@ -161,6 +164,17 @@ input-folder/
 
 ### Unreleased
 *Everything below has landed on `main` since the v1.0.0 tag.*
+
+**Safety and honest reporting**
+
+- **`--replace` no longer risks the original.** It used to `unlink()` the source and only then move the new file into place; a failing move — a full disk, a read-only parent — destroyed the image outright, and on a format change there was nothing to fall back on. The replacement now goes in first and the original is dropped afterwards. The staging directory also moved from `/var/folders` to right beside the input, which turns every replace on an external disk from a full cross-volume copy into a rename.
+- **Destructive runs ask first.** `--replace` and `--rename-only` prompt on a terminal and refuse to run without one unless you pass `--yes`. The wizard's final prompt no longer defaults to *yes* on the replace path.
+- **Ctrl+C tells the truth.** The old handler printed “nothing was changed” however far the batch had got. It now names how many images were processed and how many originals were already replaced or moved.
+- **Failures are counted and named.** A replace, move or post-hook that blew up printed a yellow warning and was then forgotten, so the closing count under-reported. Those now have their own counter, the summary lists which files failed and why, and raw encoder text like `cannot identify image file` is translated into something actionable.
+- **A failing `--post-hook` is visible.** Its exit code was ignored entirely; a non-zero exit now reports the code and the first line of stderr.
+- **`--args-file` fails honestly.** An unreadable file used to print a note and carry on with the flag still in `argv`, which then produced the baffling “`--args-file` cannot be combined with `--wizard`”. It now exits with the real reason.
+- **Unreadable EXIF is reported** instead of being dropped in silence, and the Quick Look refresh no longer runs `qlmanage -r cache`, which threw away Quick Look thumbnails for every file on the machine.
+- **`--quiet`** prints errors and nothing else.
 
 - **Target Size (`--target-size`)** – Force every output below a byte budget (`500k`, `1.5m`). Quality is binary-searched first, capped at the requested `--quality`; if no quality fits, dimensions are reduced until one does, preserving aspect ratio and never upscaling. Files that cannot reach the target are reported as errors rather than written oversized. Available on the command line and as a wizard step.
 - **Encoder Preflight** – Encodes a 1×1 image before the batch starts to verify the output format is genuinely encodable on this machine, aborting with a `pip install` hint instead of failing on the first image. Replaces the previous check, which only tested whether the optional plugin imported.

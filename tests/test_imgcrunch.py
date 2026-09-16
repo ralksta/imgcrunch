@@ -262,7 +262,7 @@ class TestReplaceMode:
         keep = tmp_path / "keep.jpg"          # already optimal -> skip/copy-through
         Image.new("RGB", (4000, 1000), (9, 9, 9)).save(big)
         Image.new("RGB", (500, 500), (1, 2, 3)).save(keep)
-        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace")
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace", "--yes")
         assert r.returncode == 0, r.stderr
         assert not (tmp_path / "converted").exists()
         assert not (tmp_path / "originals").exists()
@@ -402,7 +402,7 @@ class TestRenameOnlyCLI:
         Image.new("RGB", (300, 300), (0, 0, 255)).save(b)
         before_a = a.read_bytes()
 
-        r = self._run(str(tmp_path), "--rename-only", "--rename", "urlaub")
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "urlaub", "--yes")
         assert r.returncode == 0, r.stderr
         assert not (tmp_path / "converted").exists()
         assert not (tmp_path / "originals").exists()
@@ -765,3 +765,468 @@ class TestWizardFlagRejection:
         r = self._run("--wizard", str(tmp_path), "--strip")
         assert r.returncode != 0
         assert "--strip" in (r.stdout + r.stderr)
+
+
+# ── replace_original: the original must survive a failed move ────────────────
+
+class TestReplaceOriginal:
+    """
+    The replace path used to unlink the original *before* moving the new file
+    into place, so a failing move destroyed the image with nothing to show for
+    it. These tests pin the ordering down.
+    """
+
+    def _staged(self, tmp_path, name, content):
+        staged_dir = tmp_path / "staging"
+        staged_dir.mkdir(exist_ok=True)
+        staged = staged_dir / name
+        staged.write_bytes(content)
+        return staged
+
+    def test_original_survives_failed_move(self, tmp_path, monkeypatch):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.webp", b"NEW")
+
+        def boom(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(ic.os, "replace", boom)
+        monkeypatch.setattr(ic.shutil, "move", boom)
+
+        with pytest.raises(OSError):
+            ic.replace_original(original, staged, ".webp")
+
+        assert original.exists(), "original was destroyed by a failed move"
+        assert original.read_bytes() == b"ORIGINAL"
+
+    def test_format_change_drops_the_old_file(self, tmp_path):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.webp", b"NEW")
+
+        final = ic.replace_original(original, staged, ".webp")
+
+        assert final == tmp_path / "photo.webp"
+        assert final.read_bytes() == b"NEW"
+        assert not original.exists()
+
+    def test_same_extension_overwrites_in_place(self, tmp_path):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.jpg", b"NEW")
+
+        final = ic.replace_original(original, staged, ".jpg")
+
+        assert final == original
+        assert original.read_bytes() == b"NEW"
+
+
+# ── make_staging_dir: same volume as the images, or we lose atomicity ─────────
+
+class TestMakeStagingDir:
+    def test_sits_next_to_the_input(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+
+        staging = ic.make_staging_dir([src])
+        try:
+            assert staging.parent == src.parent, (
+                "staging must share a volume with the images so the replace "
+                "is a rename, not a full copy"
+            )
+        finally:
+            staging.rmdir()
+
+    def test_falls_back_when_input_parent_is_not_writable(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        tmp_path.chmod(0o500)
+
+        try:
+            staging = ic.make_staging_dir([src])
+        finally:
+            tmp_path.chmod(0o700)
+
+        try:
+            assert staging.exists()
+            assert staging.parent != src.parent
+        finally:
+            staging.rmdir()
+
+
+# ── Error accounting: failures after a successful encode must be counted ──────
+
+class TestErrorAccounting:
+    """
+    stats.errors only ever counted worker failures. A replace or a move that
+    blew up printed a yellow warning and was then forgotten, so the closing
+    line under-reported what had actually gone wrong.
+    """
+
+    def test_summary_reports_post_errors(self, capsys, tmp_path):
+        stats = ic.BatchStats()
+        stats.processed = 3
+        stats.post_errors = 2
+
+        ic.print_summary(stats, 1.0, tmp_path)
+
+        out = capsys.readouterr().out
+        assert "2" in out
+        assert "after" in out.lower() or "replac" in out.lower() or "mov" in out.lower()
+
+    def test_failed_replace_is_counted_and_keeps_the_original(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        img = tmp_path / "photo.jpg"
+        Image.new("RGB", (4000, 1000), (9, 9, 9)).save(img)
+        before = img.read_bytes()
+
+        def boom(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(ic, "replace_original", boom)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["imgcrunch", str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace", "--yes"],
+        )
+
+        ic.main()
+
+        out = capsys.readouterr().out
+        assert "could not replace" in out.lower()
+        assert img.exists(), "original must survive a failed replace"
+        assert img.read_bytes() == before
+
+
+# ── Post-hook: a non-zero exit must not pass silently ────────────────────────
+
+class TestPostHook:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def test_failing_hook_is_reported(self, tmp_path):
+        Image.new("RGB", (800, 600), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move",
+                      "--post-hook", "echo boom >&2; exit 3")
+
+        assert r.returncode == 0, r.stderr
+        combined = (r.stdout + r.stderr).lower()
+        # "post-hook" and "3" both appear in the echoed config line, so assert
+        # on wording that can only come from the failure report itself.
+        assert "exited with 3" in combined
+        assert "a.jpg" in combined
+
+    def test_successful_hook_stays_quiet(self, tmp_path):
+        Image.new("RGB", (800, 600), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move",
+                      "--post-hook", "true")
+
+        assert r.returncode == 0, r.stderr
+        assert "exited with" not in (r.stdout + r.stderr).lower()
+
+
+# ── Ctrl+C must describe what actually happened ──────────────────────────────
+
+class TestCancellationNotice:
+    """
+    The interrupt handler printed "nothing was changed" unconditionally, which
+    is a lie once files have been replaced or moved. It sat outside main() and
+    had no access to the counters; the text now comes from them.
+    """
+
+    def test_nothing_written_says_so(self):
+        msg = ic.cancellation_notice(ic.BatchStats(), total=20)
+
+        assert "nothing was changed" in msg.lower()
+
+    def test_replaced_files_are_named(self):
+        stats = ic.BatchStats()
+        stats.processed = 7
+        stats.replaced = 7
+
+        msg = ic.cancellation_notice(stats, total=20)
+
+        assert "nothing was changed" not in msg.lower()
+        assert "7" in msg and "20" in msg
+        assert "replac" in msg.lower()
+
+    def test_moved_originals_are_named(self):
+        stats = ic.BatchStats()
+        stats.processed = 4
+        stats.moved = 4
+
+        msg = ic.cancellation_notice(stats, total=9)
+
+        assert "nothing was changed" not in msg.lower()
+        assert "originals" in msg.lower()
+        assert "4" in msg
+
+    def test_interrupt_mid_batch_reports_progress(self, tmp_path, monkeypatch, capsys):
+        for i in range(3):
+            Image.new("RGB", (900, 700), (i * 40, i * 40, i * 40)).save(
+                tmp_path / f"p{i}.jpg"
+            )
+
+        real_move = ic.move_to_originals
+        seen = {"n": 0}
+
+        def interrupt_after_first(*args, **kwargs):
+            seen["n"] += 1
+            if seen["n"] > 1:
+                raise KeyboardInterrupt
+            return real_move(*args, **kwargs)
+
+        monkeypatch.setattr(ic, "move_to_originals", interrupt_after_first)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "jpeg"])
+
+        with pytest.raises(SystemExit):
+            ic.main()
+
+        out = capsys.readouterr().out.lower()
+        assert "cancelled" in out
+        assert "nothing was changed" not in out, (
+            "one original had already been moved when the interrupt arrived"
+        )
+
+
+# ── Destructive runs need consent ────────────────────────────────────────────
+
+class TestDestructiveConfirmation:
+    """
+    --replace and --rename-only are irreversible and used to run without a word
+    of warning outside the wizard. Without a TTY to ask on, they now need --yes.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_replace_aborts_without_consent(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(img)
+        before = img.read_bytes()
+
+        r = self._run(str(tmp_path), "-f", "webp", "--replace")
+
+        assert r.returncode != 0
+        assert "--yes" in r.stdout + r.stderr
+        assert img.exists() and img.read_bytes() == before
+
+    def test_replace_proceeds_with_yes(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(img)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "400", "--replace", "--yes")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(img) as im:
+            assert max(im.size) == 400
+
+    def test_rename_only_aborts_without_consent(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (300, 200), (4, 5, 6)).save(img)
+
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "trip")
+
+        assert r.returncode != 0
+        assert "--yes" in r.stdout + r.stderr
+        assert img.exists(), "the original name must survive"
+
+    def test_dry_run_needs_no_consent(self, tmp_path):
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--replace", "--dry-run")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ── The wizard must not default to yes on a destructive run ──────────────────
+
+class TestWizardDestructiveDefault:
+    """
+    The final prompt was "(Y/n)" for every mode, so hitting Enter on the
+    replace path overwrote every original. A default must never be the
+    irreversible option.
+    """
+
+    def test_replace_needs_an_explicit_yes(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"(1/2/3)": "2"})
+
+        assert result is None, "Enter must not start a replace run"
+
+    def test_replace_starts_on_an_explicit_yes(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(
+            monkeypatch, wizard_dir, {"(1/2/3)": "2", "start processing": "y"}
+        )
+
+        assert result is not None
+        assert result["replace"] is True
+
+    def test_keep_originals_still_starts_on_enter(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result is not None, "the safe path should keep its Enter default"
+        assert result["replace"] is False
+
+
+# ── --args-file: the Quick Action path must fail honestly ────────────────────
+
+class TestArgsFile:
+    """
+    --args-file is how the macOS Quick Action hands the Finder selection over.
+    A read failure used to print a line and carry on with the flag still in
+    argv, so the user was told "--args-file cannot be combined with --wizard"
+    for a flag they never typed.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_missing_file_names_the_real_problem(self, tmp_path):
+        r = self._run("--wizard", "--args-file", str(tmp_path / "gone.txt"))
+
+        assert r.returncode == 2
+        out = r.stdout + r.stderr
+        assert "cannot be combined" not in out, "that is not what went wrong"
+        assert "args-file" in out.lower()
+
+    def test_expands_one_argument_per_line(self, tmp_path):
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(tmp_path / "a.jpg")
+        args_file = tmp_path / "args.txt"
+        args_file.write_text(f"{tmp_path}\n--dry-run\n")
+
+        r = self._run("--args-file", str(args_file))
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "dry" in r.stdout.lower()
+        assert not args_file.exists(), "the temp args file should be cleaned up"
+
+
+# ── Failures should be readable, and you should learn which files ────────────
+
+class TestErrorReporting:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_humanize_explains_an_unreadable_file(self):
+        out = ic.humanize_error("cannot identify image file '/x/a.jpg'")
+
+        assert "cannot identify image file" not in out
+        assert "readable" in out.lower() or "damaged" in out.lower()
+
+    def test_humanize_leaves_a_clear_message_alone(self):
+        msg = "cannot reach target size 500.0 KB"
+
+        assert ic.humanize_error(msg) == msg
+
+    def test_summary_names_the_failing_files(self, tmp_path):
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(tmp_path / "good.jpg")
+        (tmp_path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move")
+        out = r.stdout + r.stderr
+        summary = out.split("Processing Summary")[-1]
+
+        assert "bad.jpg" in summary, "the summary should name what failed"
+        assert "good.jpg" not in summary
+
+
+# ── Quick Look refresh must not nuke the system-wide cache ───────────────────
+
+class TestRefreshQuicklook:
+    def test_touches_files_without_killing_the_shared_cache(self, tmp_path, monkeypatch):
+        if not ic.IS_MACOS:
+            pytest.skip("macOS only")
+
+        ran = []
+        monkeypatch.setattr(ic.subprocess, "run",
+                            lambda *a, **k: ran.append(a) or None)
+        target = tmp_path / "a.jpg"
+        target.write_bytes(b"x")
+        target.touch()
+        before = target.stat().st_mtime_ns
+
+        ic.refresh_quicklook([target])
+
+        assert not any("qlmanage" in str(call) for call in ran), (
+            "qlmanage -r cache invalidates Quick Look for the whole system"
+        )
+        assert target.stat().st_mtime_ns >= before
+
+
+# ── A dropped EXIF block is data loss and must be said out loud ──────────────
+
+class TestExifFailureIsReported:
+    def test_unreadable_exif_produces_a_warning(self, tmp_path, monkeypatch):
+        src = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(src)
+
+        def boom(*args, **kwargs):
+            raise ValueError("corrupt exif block")
+
+        monkeypatch.setattr(ic.piexif, "load", boom)
+
+        result = ic.process_image(str(src), str(tmp_path / "out.jpg"),
+                                  job(max_size=400))
+
+        assert result.error is None
+        assert result.warning and "exif" in result.warning.lower()
+
+
+# ── --quiet: everything but the problems ─────────────────────────────────────
+
+class TestQuiet:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_suppresses_the_running_commentary(self, tmp_path):
+        Image.new("RGB", (2400, 1800), (1, 2, 3)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "600", "--no-move", "--quiet")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Workers:" not in r.stdout
+        assert "Processing Summary" not in r.stdout
+        assert "Resized" not in r.stdout, "per-file progress is chatter too"
+        assert (tmp_path / "converted" / "a.jpg").exists(), "it still has to work"
+
+    def test_still_reports_failures(self, tmp_path):
+        (tmp_path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move", "--quiet")
+
+        assert "bad.jpg" in r.stdout + r.stderr, "errors must survive --quiet"
+
+
+class TestCancellationMentionsInflightOutputs:
+    """
+    Cancelling stops the consumer loop, but workers already running finish the
+    image they are on. A run cancelled at 14 of 50 can leave far more than 14
+    outputs on disk, so the notice must not imply otherwise.
+    """
+
+    def test_warns_that_more_outputs_may_exist(self):
+        stats = ic.BatchStats()
+        stats.processed = 14
+        stats.moved = 14
+
+        msg = ic.cancellation_notice(stats, total=50)
+
+        assert "in flight" in msg.lower() or "already running" in msg.lower()
