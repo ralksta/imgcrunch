@@ -2124,7 +2124,18 @@ def main():
                 pct = int(completed_tasks / len(tasks) * 100)
                 set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
             
-                result: ProcessResult = future.result()
+                try:
+                    result: ProcessResult = future.result()
+                except Exception as exc:
+                    # The worker never returned a result: the OS killed it -
+                    # typically for running out of memory - or the pool broke.
+                    # Book it like any failed image, so its original stays put
+                    # and the rest of the batch still gets reported.
+                    result = ProcessResult(
+                        input=str(img_path), output='', input_format=img_path.suffix.lower(),
+                        error=(f"worker process died ({type(exc).__name__}) \u2014 often out "
+                               f"of memory; try again with fewer --workers"),
+                    )
 
                 if result.error:
                     reason = humanize_error(result.error)

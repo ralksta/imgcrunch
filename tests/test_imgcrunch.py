@@ -1965,3 +1965,78 @@ class TestPackaging:
     def test_heic_and_jxl_hints_name_their_plugins(self):
         assert "pillow-heif" in ic.ENCODER_HINTS["heic"]
         assert "pillow-jxl-plugin" in ic.ENCODER_HINTS["jxl"]
+
+
+# ── A worker process that dies must not take the whole batch down ────────────
+
+class _CrashingExecutor:
+    """
+    Runs process_image in-process, except for files named crash*, whose future
+    fails the way a pool does when the OS kills a worker (e.g. out of memory).
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+        from concurrent.futures.process import BrokenProcessPool
+        future = Future()
+        if Path(args[0]).name.startswith("crash"):
+            future.set_exception(BrokenProcessPool(
+                "A process in the process pool was terminated abruptly"))
+        else:
+            future.set_result(fn(*args))
+        return future
+
+    def shutdown(self, *args, **kwargs):
+        pass
+
+
+class TestWorkerCrash:
+    def _batch(self, tmp_path):
+        for name in ("a.jpg", "crash.jpg", "b.jpg"):
+            Image.new("RGB", (900, 700), (7, 8, 9)).save(tmp_path / name)
+
+    def test_crash_is_reported_and_the_rest_still_runs(self, tmp_path, monkeypatch, capsys):
+        self._batch(tmp_path)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp"])
+
+        ic.main()                                   # must not raise
+
+        out = capsys.readouterr().out
+        summary = out.split("Processing Summary")[-1]
+        assert "crash.jpg" in summary
+        assert "worker" in summary.lower()
+        assert (tmp_path / "converted" / "a.webp").exists()
+        assert (tmp_path / "converted" / "b.webp").exists()
+
+    def test_crashed_file_keeps_its_original_in_place(self, tmp_path, monkeypatch, capsys):
+        self._batch(tmp_path)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp"])
+
+        ic.main()
+
+        assert (tmp_path / "crash.jpg").exists(), "no output was made, so nothing may be moved"
+        assert (tmp_path / "originals" / "a.jpg").exists()
+
+    def test_replace_run_cleans_up_its_staging_dir(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "photos"
+        src.mkdir()
+        self._batch(src)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(src), "-f", "webp",
+                                          "--replace", "--yes"])
+
+        ic.main()
+
+        assert (src / "crash.jpg").exists()
+        assert not list(tmp_path.glob("imgcrunch_tmp_*")), "staging dir left behind"
