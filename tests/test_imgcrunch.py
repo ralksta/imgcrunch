@@ -1230,3 +1230,104 @@ class TestCancellationMentionsInflightOutputs:
         msg = ic.cancellation_notice(stats, total=50)
 
         assert "in flight" in msg.lower() or "already running" in msg.lower()
+
+
+# ── The wizard and argparse must describe the same settings ──────────────────
+
+class TestWizardArgparseAgreement:
+    """
+    The wizard returns a dict that main() turns straight into an
+    argparse.Namespace. Every key therefore has to match an argparse dest, and
+    nothing enforced that: main() reads the settings back with
+    getattr(args, ..., default), so a typo in the wizard dict silently became
+    "user did not ask for this" instead of an error.
+    """
+
+    def _wizard_keys(self, monkeypatch, wizard_dir, answers=None):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, answers)
+        assert result is not None
+        return set(result)
+
+    def test_normal_run_keys_all_exist_in_the_parser(self, monkeypatch, wizard_dir):
+        dests = {a.dest for a in ic.build_parser()._actions}
+
+        assert self._wizard_keys(monkeypatch, wizard_dir) <= dests
+
+    def test_rename_only_keys_all_exist_in_the_parser(self, monkeypatch, wizard_dir):
+        dests = {a.dest for a in ic.build_parser()._actions}
+        keys = self._wizard_keys(monkeypatch, wizard_dir,
+                                 {"(1/2/3)": "3", "base name": "urlaub"})
+
+        assert keys <= dests
+
+    def test_both_wizard_exits_return_the_same_keys(self, monkeypatch, wizard_dir):
+        normal = self._wizard_keys(monkeypatch, wizard_dir)
+        renaming = self._wizard_keys(monkeypatch, wizard_dir,
+                                     {"(1/2/3)": "3", "base name": "urlaub"})
+
+        assert normal == renaming, (
+            "the two return statements have drifted apart"
+        )
+
+
+# ── Which paths skip the format question (characterisation before refactor) ──
+
+@pytest.fixture
+def two_files(tmp_path):
+    a = tmp_path / "one.jpg"
+    b = tmp_path / "two.jpg"
+    Image.new("RGB", (900, 700), (200, 40, 40)).save(a)
+    Image.new("RGB", (640, 480), (40, 200, 40)).save(b)
+    return [a, b]
+
+
+def _drive_wizard_paths(monkeypatch, paths, answers=None):
+    import re as _re
+
+    answers = dict(answers or {})
+    seen = []
+
+    def fake_input(prompt=""):
+        plain = _re.sub(r"\033\[[0-9;]*m", "", str(prompt)).lower()
+        seen.append(plain)
+        for needle, reply in answers.items():
+            if needle in plain:
+                return reply.pop(0) if isinstance(reply, list) else reply
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return ic.startup_wizard(prefills=[str(p) for p in paths]), seen
+
+
+class TestWizardFormatQuestionReach:
+    def _asked_for_format(self, seen):
+        return any("1/2/3/4/5" in p for p in seen)
+
+    def test_merge_copy_only_skips_the_format_question(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "1"})
+
+        assert result is not None
+        assert result["format"] == "original"
+        assert not self._asked_for_format(seen)
+
+    def test_merge_and_convert_asks_for_a_format(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "2"})
+
+        assert result is not None
+        assert result["format"] != "original"
+        assert self._asked_for_format(seen)
+
+    def test_rename_only_skips_the_format_question(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(
+            monkeypatch, two_files, {"(1/2/3/4)": "4", "base name": "trip"}
+        )
+
+        assert result is not None
+        assert result["rename_only"] is True
+        assert not self._asked_for_format(seen)
+
+    def test_process_individually_asks_for_a_format(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "3"})
+
+        assert result is not None
+        assert self._asked_for_format(seen)

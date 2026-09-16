@@ -735,6 +735,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
 
     # Set by the copy-only / rename-only branches below; None means the
     # corresponding question still has to be asked.
+    format_key: Optional[str] = None
     max_px       = None
     target_bytes = None
 
@@ -853,7 +854,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print()
 
     # 3. Format (if not copy-only)
-    if 'format_key' not in locals():
+    if format_key is None:
         format_keys    = ['jpeg', 'heic', 'avif', 'webp', 'jxl']
         detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else None
         default_index  = detected_index or '1'
@@ -1377,6 +1378,90 @@ def rename_in_place(images: list[Path], rename_base: str, dry_run: bool = False)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def build_parser() -> argparse.ArgumentParser:
+    """
+    The CLI's argument definitions, in one place a test can reach.
+
+    The wizard hands main() a dict that becomes an argparse.Namespace, so
+    every wizard key has to be an argparse dest here. Building the parser
+    inside main() made that agreement untestable; the drift it allowed was
+    invisible because main() reads settings back with getattr defaults.
+    """
+    parser = argparse.ArgumentParser(
+        prog='imgcrunch',
+        description='ImgCrunch — Fast parallel image cruncher with format conversion.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Output modes:
+  By default, converted files go to <input>/converted/ and originals are
+  moved to <input>/originals/. Use --replace to overwrite originals in-place
+  (destructive). Use --no-move to leave originals where they are.
+
+Quality defaults (tuned per format):
+  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82   JXL: 85
+
+Examples:
+  imgcrunch /path/to/images                          # JPEG, smart quality, no resize
+  imgcrunch /path/to/images -f heic                  # HEIC with smart quality default
+  imgcrunch /path/to/images -f avif --max-size 2000  # AVIF, cap at 2000px
+  imgcrunch /path/to/images --lossless -f avif       # lossless AVIF
+  imgcrunch /path/to/images --target-size 500k        # every output under 500 KB
+  imgcrunch /path/to/images --skip-dupes             # skip content-identical files
+  imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
+  imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
+  imgcrunch /path/to/images --rename-only --rename vacation
+                                                # rename in-place only, no recompression
+  imgcrunch /path/to/images --strip                  # remove EXIF metadata
+  imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
+  imgcrunch /path/to/images --dry-run                # preview plan, write nothing
+  imgcrunch --wizard /path/to/images                 # interactive wizard
+        """
+    )
+    parser.add_argument('input_folders', nargs='+',
+                        help='Path to the folder(s) or file(s) containing images to process')
+    parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'jxl', 'original'], default='jpeg',
+                        help='Output format (default: jpeg, or original to keep format)')
+    parser.add_argument('-q', '--quality', type=int, default=None,
+                        help='Compression quality 1–100 (default: smart per-format default)')
+    parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
+                        help=f'Max longest side in px; 0 = convert only (default: {DEFAULT_MAX_SIZE})')
+    parser.add_argument('-o', '--output',
+                        help=f'Custom output folder (default: first <input>/{OUTPUT_FOLDER_NAME})')
+    parser.add_argument('--replace', action='store_true',
+                        help='Replace originals in-place (⚠️  destructive, no backup)')
+    parser.add_argument('--no-move', action='store_true',
+                        help="Keep originals in place (don't move to originals/)")
+    parser.add_argument('--rename', type=str, default=None, metavar='NAME',
+                        help='Rename output files as NAME_001, NAME_002, ...')
+    parser.add_argument('--rename-only', action='store_true', dest='rename_only',
+                        help='Only rename files in-place (no conversion, no resize, '
+                             'no copies). Requires --rename NAME.')
+    parser.add_argument('--lossless', action='store_true',
+                        help='Lossless encode (AVIF and WebP only)')
+    parser.add_argument('--target-size', type=str, default=None, dest='target_size',
+                        metavar='SIZE',
+                        help='Shrink every output below SIZE (e.g. 500k, 1.5m). '
+                             'Lowers quality first, then dimensions if needed.')
+    parser.add_argument('--skip-dupes', action='store_true',
+                        help='Skip files that are content-identical to an already-processed file')
+    parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
+                        help='Strip EXIF metadata from output images (Privacy Mode)')
+    parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
+                        help='Shell command to run after each file. '
+                             'Use {in} and {out} as placeholders.')
+    parser.add_argument('--merge', action='store_true',
+                        help='Merge all input folders/files into a single output folder')
+    parser.add_argument('--dry-run', action='store_true', dest='dry_run',
+                        help='Show what would be processed without writing anything')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Print only errors — no config table, progress '
+                             'bar or summary')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Skip the confirmation prompt for --replace '
+                             'and --rename-only')
+    return parser
+
+
 def main():
     # Expand --args-file if present
     if '--args-file' in sys.argv:
@@ -1425,78 +1510,7 @@ def main():
             sys.exit(0)
         args = argparse.Namespace(**wizard_result)
     else:
-        parser = argparse.ArgumentParser(
-            prog='imgcrunch',
-            description='ImgCrunch — Fast parallel image cruncher with format conversion.',
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""\
-Output modes:
-  By default, converted files go to <input>/converted/ and originals are
-  moved to <input>/originals/. Use --replace to overwrite originals in-place
-  (destructive). Use --no-move to leave originals where they are.
-
-Quality defaults (tuned per format):
-  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82   JXL: 85
-
-Examples:
-  imgcrunch /path/to/images                          # JPEG, smart quality, no resize
-  imgcrunch /path/to/images -f heic                  # HEIC with smart quality default
-  imgcrunch /path/to/images -f avif --max-size 2000  # AVIF, cap at 2000px
-  imgcrunch /path/to/images --lossless -f avif       # lossless AVIF
-  imgcrunch /path/to/images --target-size 500k        # every output under 500 KB
-  imgcrunch /path/to/images --skip-dupes             # skip content-identical files
-  imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
-  imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
-  imgcrunch /path/to/images --rename-only --rename vacation
-                                                    # rename in-place only, no recompression
-  imgcrunch /path/to/images --strip                  # remove EXIF metadata
-  imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
-  imgcrunch /path/to/images --dry-run                # preview plan, write nothing
-  imgcrunch --wizard /path/to/images                 # interactive wizard
-            """
-        )
-        parser.add_argument('input_folders', nargs='+',
-                            help='Path to the folder(s) or file(s) containing images to process')
-        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'jxl', 'original'], default='jpeg',
-                            help='Output format (default: jpeg, or original to keep format)')
-        parser.add_argument('-q', '--quality', type=int, default=None,
-                            help='Compression quality 1–100 (default: smart per-format default)')
-        parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
-                            help=f'Max longest side in px; 0 = convert only (default: {DEFAULT_MAX_SIZE})')
-        parser.add_argument('-o', '--output',
-                            help=f'Custom output folder (default: first <input>/{OUTPUT_FOLDER_NAME})')
-        parser.add_argument('--replace', action='store_true',
-                            help='Replace originals in-place (⚠️  destructive, no backup)')
-        parser.add_argument('--no-move', action='store_true',
-                            help="Keep originals in place (don't move to originals/)")
-        parser.add_argument('--rename', type=str, default=None, metavar='NAME',
-                            help='Rename output files as NAME_001, NAME_002, ...')
-        parser.add_argument('--rename-only', action='store_true', dest='rename_only',
-                            help='Only rename files in-place (no conversion, no resize, '
-                                 'no copies). Requires --rename NAME.')
-        parser.add_argument('--lossless', action='store_true',
-                            help='Lossless encode (AVIF and WebP only)')
-        parser.add_argument('--target-size', type=str, default=None, dest='target_size',
-                            metavar='SIZE',
-                            help='Shrink every output below SIZE (e.g. 500k, 1.5m). '
-                                 'Lowers quality first, then dimensions if needed.')
-        parser.add_argument('--skip-dupes', action='store_true',
-                            help='Skip files that are content-identical to an already-processed file')
-        parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
-                            help='Strip EXIF metadata from output images (Privacy Mode)')
-        parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
-                            help='Shell command to run after each file. '
-                                 'Use {in} and {out} as placeholders.')
-        parser.add_argument('--merge', action='store_true',
-                            help='Merge all input folders/files into a single output folder')
-        parser.add_argument('--dry-run', action='store_true', dest='dry_run',
-                            help='Show what would be processed without writing anything')
-        parser.add_argument('--quiet', action='store_true',
-                            help='Print only errors — no config table, progress '
-                                 'bar or summary')
-        parser.add_argument('-y', '--yes', action='store_true',
-                            help='Skip the confirmation prompt for --replace '
-                                 'and --rename-only')
+        parser = build_parser()
         args = parser.parse_args()
 
     # Resolve quality
