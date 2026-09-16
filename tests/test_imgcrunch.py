@@ -2243,3 +2243,59 @@ class TestExitCode:
                                           "--no-move", "--quiet"])
 
         assert ic.main() == 1
+
+
+# ── Transparent images already in an alpha-capable target format ─────────────
+
+class TestTransparentCopyThrough:
+    """
+    The byte-copy gate required mode RGB or L, a rule written for JPEG and
+    HEIC, which cannot hold transparency. It also caught AVIF, WebP and JPEG XL
+    files with an alpha channel, so converting a folder of transparent AVIFs to
+    AVIF re-encoded every one of them for nothing - pure generational loss.
+    """
+
+    def _transparent(self, path, fmt, plugin=None):
+        if plugin:
+            pytest.importorskip(plugin)
+        if ic.probe_encoder(fmt):
+            pytest.skip(f"{fmt} not encodable here")
+        img = Image.merge("RGB", [Image.effect_noise((600, 400), 40)] * 3).convert("RGBA")
+        img.putalpha(Image.linear_gradient("L").resize((600, 400)))
+        img.save(path, ic.FORMAT_CONFIG[fmt]["pillow_format"], quality=90)
+
+    @pytest.mark.parametrize("fmt, plugin", [("avif", None), ("webp", None),
+                                             ("jxl", "pillow_jxl")])
+    def test_same_format_is_copied_byte_for_byte(self, tmp_path, fmt, plugin):
+        ext = ic.FORMAT_CONFIG[fmt]["extension"]
+        src = tmp_path / f"in{ext}"
+        self._transparent(src, fmt, plugin)
+        out = tmp_path / f"out{ext}"
+
+        res = ic.process_image(str(src), str(out), job(fmt, quality=60))
+
+        assert res.error is None, res.error
+        assert res.skipped is True
+        assert out.read_bytes() == src.read_bytes(), "re-encoded instead of copied"
+
+    def test_strip_still_reencodes_and_keeps_the_alpha(self, tmp_path):
+        src = tmp_path / "in.avif"
+        self._transparent(src, "avif")
+        out = tmp_path / "out.avif"
+
+        res = ic.process_image(str(src), str(out), job("avif", strip_exif=True))
+
+        assert res.skipped is False
+        with Image.open(out) as im:
+            assert "A" in im.getbands()
+
+    def test_transparent_webp_into_jpeg_is_still_flattened(self, tmp_path):
+        src = tmp_path / "in.webp"
+        self._transparent(src, "webp")
+        out = tmp_path / "out.jpg"
+
+        res = ic.process_image(str(src), str(out), job("jpeg"))
+
+        assert res.skipped is False
+        with Image.open(out) as im:
+            assert im.mode == "RGB"
