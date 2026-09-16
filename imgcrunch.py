@@ -117,6 +117,10 @@ FORMAT_CONFIG = {
     'jxl':  {'extension': '.jxl',  'pillow_format': 'JXL',  'extra_opts': {}},
 }
 
+# Output formats that store an alpha channel. JPEG and HEIC output is flattened
+# onto white; see process_image.
+ALPHA_FORMATS = ('webp', 'avif', 'jxl')
+
 IS_MACOS = sys.platform == 'darwin'
 
 
@@ -559,9 +563,14 @@ def process_image(
             # Byte-copy gate: nothing in the settings forces a re-encode AND
             # nothing about this particular image does either. Copy straight
             # through — zero generational loss.
+            # A file already in an alpha-capable target format can keep its
+            # alpha channel as it is; only JPEG and HEIC output needs RGB or L,
+            # because transparency there has to be flattened.
+            copyable_modes = ('RGB', 'L', 'RGBA', 'LA') if format_key in ALPHA_FORMATS \
+                else ('RGB', 'L')
             if already_target and not settings.forces_reencode() \
                     and not needs_resize(width, height, max_size) \
-                    and img.mode in ('RGB', 'L') and not is_animated_gif \
+                    and img.mode in copyable_modes and not is_animated_gif \
                     and target_ok:
                 result.skipped  = True
                 result.new_size = (width, height)
@@ -652,7 +661,7 @@ def process_image(
                 # Handle Static Image
                 # Mode conversion
                 # Keep RGBA/LA/P transparency if output format supports alpha (webp, avif, jxl)
-                supports_alpha = format_key in ('webp', 'avif', 'jxl')
+                supports_alpha = format_key in ALPHA_FORMATS
                 if img.mode in ('RGBA', 'LA', 'P'):
                     if supports_alpha:
                         if img.mode != 'RGBA':

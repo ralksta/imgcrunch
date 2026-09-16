@@ -251,6 +251,7 @@ input-folder/
 - **`--args-file` fails honestly.** An unreadable file used to print a note and carry on with the flag still in `argv`, which then produced the baffling “`--args-file` cannot be combined with `--wizard`”. It now exits with the real reason.
 - **Unreadable EXIF is reported** instead of being dropped in silence, and the Quick Look refresh no longer runs `qlmanage -r cache`, which threw away Quick Look thumbnails for every file on the machine.
 - **`--quiet`** prints errors and nothing else.
+- **Transparent AVIF, WebP and JPEG XL files are no longer re-encoded into their own format.** The copy-through rule only admitted images without an alpha channel — a rule meant for JPEG and HEIC — so converting a folder of transparent AVIFs to AVIF recompressed every one of them. They are now copied byte for byte like any other file that needs no change.
 - **The exit code reports failures.** It was 0 even when images failed; it is now 1 whenever an image, or a replace, move or post-hook after it, failed — which is what makes `--quiet` usable in scripts.
 
 - **Target Size (`--target-size`)** – Force every output below a byte budget (`500k`, `1.5m`). Quality is binary-searched first, capped at the requested `--quality`; if no quality fits, dimensions are reduced until one does, preserving aspect ratio and never upscaling. Files that cannot reach the target are reported as errors rather than written oversized. Available on the command line and as a wizard step.
