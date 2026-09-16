@@ -2,19 +2,29 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # install_macos_quick_action.sh
 # Installs a macOS Finder Quick Action (right-click → Quick Actions) that
-# launches ImgCrunch on a selected folder.
+# launches the ImgCrunch wizard on the selected files and folders.
+#
+# The action calls a small launcher in ~/Library/Application Support/ImgCrunch,
+# which starts the `imgcrunch` command when it is installed (pipx) and this
+# clone's resize.sh otherwise. Moving the clone therefore only breaks the
+# action in the second case, and then the launcher says so.
 #
 # Usage:  bash install_macos_quick_action.sh
 # Requires: macOS with Automator / Quick Actions support
+#
+# For tests: IMGCRUNCH_SERVICES_DIR and IMGCRUNCH_SUPPORT_DIR redirect where
+# things are written, and IMGCRUNCH_SKIP_REFRESH=1 skips the services refresh.
 # ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKFLOW_NAME="ImgCrunch"
-SERVICES_DIR="$HOME/Library/Services"
+SERVICES_DIR="${IMGCRUNCH_SERVICES_DIR:-$HOME/Library/Services}"
+SUPPORT_DIR="${IMGCRUNCH_SUPPORT_DIR:-$HOME/Library/Application Support/ImgCrunch}"
 WORKFLOW_DIR="$SERVICES_DIR/${WORKFLOW_NAME}.workflow"
 CONTENTS_DIR="$WORKFLOW_DIR/Contents"
+LAUNCHER="$SUPPORT_DIR/launch.sh"
 
 echo ""
 echo "🖼️  ImgCrunch — macOS Quick Action Installer"
@@ -27,11 +37,57 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-# Check that resize.sh exists
-if [[ ! -f "$SCRIPT_DIR/resize.sh" ]]; then
-    echo "❌  resize.sh not found in $SCRIPT_DIR"
+# What the action should start. An `imgcrunch` found inside this clone (the
+# venv's editable install) does not count: it would tie the action to the
+# clone's location just like resize.sh does, without the venv check.
+TARGET=""
+if CANDIDATE="$(command -v imgcrunch 2>/dev/null)"; then
+    CANDIDATE_REAL="$(cd "$(dirname "$CANDIDATE")" && pwd -P)/$(basename "$CANDIDATE")"
+    if [[ "$CANDIDATE_REAL" != "$(cd "$SCRIPT_DIR" && pwd -P)/"* ]]; then
+        TARGET="$CANDIDATE"
+        TARGET_KIND="the installed imgcrunch command"
+    fi
+fi
+if [[ -z "$TARGET" ]]; then
+    if [[ ! -f "$SCRIPT_DIR/resize.sh" ]]; then
+        echo "❌  No imgcrunch command on PATH and no resize.sh in $SCRIPT_DIR"
+        exit 1
+    fi
+    TARGET="$SCRIPT_DIR/resize.sh"
+    TARGET_KIND="resize.sh in this clone"
+fi
+
+# The launcher path ends up inside AppleScript, inside a shell string, inside
+# XML. Refuse the few characters that would need escaping at every layer.
+case "$LAUNCHER" in
+    *[\'\"\\\&\<\>]*)
+        echo "❌  Cannot install into a path containing quotes, backslashes, & < or >:"
+        echo "    $LAUNCHER"
+        exit 1 ;;
+esac
+
+# ── Launcher ─────────────────────────────────────────────────────────────────
+mkdir -p "$SUPPORT_DIR"
+{
+    echo '#!/bin/bash'
+    echo '# Written by install_macos_quick_action.sh; the Finder Quick Action runs this.'
+    printf 'TARGET=%q\n' "$TARGET"
+    cat << 'LAUNCH_EOF'
+if [[ ! -f "$TARGET" ]]; then
+    echo "ImgCrunch is no longer at:"
+    echo "  $TARGET"
+    echo ""
+    echo "It was moved or uninstalled. Run install_macos_quick_action.sh again"
+    echo "from wherever ImgCrunch lives now."
     exit 1
 fi
+if [[ "$TARGET" == *.sh ]]; then
+    exec bash "$TARGET" "$@"
+fi
+exec "$TARGET" "$@"
+LAUNCH_EOF
+} > "$LAUNCHER"
+chmod +x "$LAUNCHER"
 
 # Remove old workflow if present
 if [[ -d "$WORKFLOW_DIR" ]]; then
@@ -79,7 +135,7 @@ PLIST_EOF
 
 # ── document.wflow ──────────────────────────────────────────────────────────
 # Automator workflow XML that runs a shell script to open Terminal with the
-# selected folder passed to resize.sh
+# selection written to a per-user temp file for the launcher
 cat > "$CONTENTS_DIR/document.wflow" << WFLOW_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -142,11 +198,11 @@ cat > "$CONTENTS_DIR/document.wflow" << WFLOW_EOF
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>ARGS_FILE=\$(mktemp /tmp/imgcrunch_args.XXXXXX)
+					<string>ARGS_FILE=\$(mktemp -t imgcrunch_args)
 for f in "\$@"; do
 	echo "\$f" >> "\$ARGS_FILE"
 done
-osascript -e "tell application \"Terminal\"" -e "activate" -e "do script \"bash '\${SCRIPT_PATH}' --wizard --args-file '\$ARGS_FILE'\"" -e "end tell"</string>
+osascript -e "tell application \"Terminal\"" -e "activate" -e "do script \"'${LAUNCHER}' --wizard --args-file '\$ARGS_FILE'\"" -e "end tell"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>
@@ -313,23 +369,28 @@ osascript -e "tell application \"Terminal\"" -e "activate" -e "do script \"bash 
 </plist>
 WFLOW_EOF
 
-# ── Fix the COMMAND_STRING to embed the actual script path ──────────────────
-# We need to replace the placeholder with the real path (heredoc already expanded
-# SCRIPT_DIR in the AppleScript, but for the shell script action we do it via sed)
-ESCAPED_PATH=$(echo "$SCRIPT_DIR/resize.sh" | sed 's/[&/]/\\&/g')
-sed -i '' "s|\\\${SCRIPT_PATH}|${ESCAPED_PATH}|g" "$CONTENTS_DIR/document.wflow"
-
-# Refresh macOS services cache
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local -domain user 2>/dev/null || true
+# Refresh the Services menu. This used to run `lsregister -kill -r`, which
+# resets the whole LaunchServices database; pbs -update rebuilds only services.
+if [[ -z "${IMGCRUNCH_SKIP_REFRESH:-}" ]]; then
+    /System/Library/CoreServices/pbs -update 2>/dev/null || true
+fi
 
 echo "✅  Quick Action installed to:"
 echo "    $WORKFLOW_DIR"
+echo ""
+echo "▶️  It starts $TARGET_KIND:"
+echo "    $TARGET"
+if [[ "$TARGET" == */resize.sh ]]; then
+    echo "    Moving this clone breaks the action; run this installer again afterwards,"
+    echo "    or install the command with pipx and re-run it to be independent of the clone."
+fi
 echo ""
 echo "📂  How to use:"
 echo "    1. Open Finder"
 echo "    2. Right-click any folder"
 echo "    3. Quick Actions → \"${WORKFLOW_NAME}\""
 echo ""
-echo "🗑️  To uninstall, simply delete:"
+echo "🗑️  To uninstall, delete:"
 echo "    $WORKFLOW_DIR"
+echo "    $SUPPORT_DIR"
 echo ""

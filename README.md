@@ -70,7 +70,9 @@ To process images directly from Finder:
 ```bash
 bash install_macos_quick_action.sh
 ```
-*To uninstall, simply delete `~/Library/Services/ImgCrunch.workflow`.*
+The action starts the `imgcrunch` command if pipx installed it, and this clone's `resize.sh` otherwise. With pipx you can move or delete the clone freely; without it, run the installer again after moving the clone — the action tells you so if you forget.
+
+*To uninstall, delete `~/Library/Services/ImgCrunch.workflow` and `~/Library/Application Support/ImgCrunch`.*
 
 ---
 
@@ -201,6 +203,12 @@ input-folder/
 
 ### Unreleased
 *Everything below has landed on `main` since the v1.0.0 tag.*
+
+**Installation**
+
+- **`pipx install './imgcrunch[all]'`** puts an `imgcrunch` command on your PATH; `imgcrunch --version` reports the version. Pillow is the only hard dependency — HEIC, JPEG XL, piexif and tqdm are extras — and AVIF needs no plugin at all.
+- **The Quick Action survives moving the clone** when imgcrunch is installed with pipx, and explains itself instead of failing silently when it is not. Its temp file moved out of the shared `/tmp`, and installing it no longer resets the system-wide LaunchServices database (`lsregister -kill`); it refreshes only the Services menu.
+- **`resize.sh` explains a missing venv** instead of printing a bare shell error.
 
 **Performance**
 
