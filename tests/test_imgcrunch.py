@@ -74,8 +74,14 @@ class TestNeedsResize:
 
 class TestDetectDominantFormat:
     def test_dominant(self, tmp_path):
+        imgs = [tmp_path / f"a{i}.jpg" for i in range(6)] + [tmp_path / "b.png"]
+        assert ic.detect_dominant_format(imgs) == "jpeg"
+
+    def test_png_folder_suggests_a_format_that_keeps_transparency(self, tmp_path):
+        # PNG used to map to JPEG, so the wizard's default for a folder of
+        # PNGs flattened every transparent pixel onto white without a word.
         imgs = [tmp_path / f"a{i}.png" for i in range(6)] + [tmp_path / "b.jpg"]
-        assert ic.detect_dominant_format(imgs) == "jpeg"  # png maps to jpeg
+        assert ic.detect_dominant_format(imgs) == "webp"
 
     def test_no_majority_falls_back(self, tmp_path):
         imgs = [tmp_path / "a.heic", tmp_path / "b.webp", tmp_path / "c.avif"]
@@ -1331,3 +1337,62 @@ class TestWizardFormatQuestionReach:
 
         assert result is not None
         assert self._asked_for_format(seen)
+
+
+
+# ── Flattening transparency must be announced ────────────────────────────────
+
+class TestAlphaFlattenWarning:
+    def test_transparent_png_into_jpeg_warns(self, tmp_path):
+        src = tmp_path / "logo.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 0), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.jpg"), job())
+
+        assert res.error is None
+        assert res.warning and "transparen" in res.warning.lower()
+
+    def test_fully_opaque_rgba_does_not_warn(self, tmp_path):
+        # An alpha channel that is 255 everywhere loses nothing when flattened.
+        src = tmp_path / "shot.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 255), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.jpg"), job())
+
+        assert res.error is None
+        assert not res.warning
+
+    def test_transparent_png_into_webp_does_not_warn(self, tmp_path):
+        src = tmp_path / "logo.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 0), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.webp"), job("webp"))
+
+        assert res.error is None
+        assert not res.warning
+
+
+class TestWizardDefaultsMatchTheCli:
+    def test_enter_on_max_size_uses_the_cli_default(self, monkeypatch, wizard_dir):
+        # The CLI and the README say 3000; the wizard used to treat Enter as
+        # "no resizing", so the same tool resized or didn't depending on the door.
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["max_size"] == ic.DEFAULT_MAX_SIZE
+
+    def test_zero_still_means_no_resizing(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"max longest side": "0"})
+
+        assert result["max_size"] == 0
+
+
+class TestWizardNamesVanishedSelections:
+    def test_missing_prefill_is_named(self, monkeypatch, two_files, capsys):
+        gone = two_files[0].parent / "deleted-meanwhile.jpg"
+
+        result, _ = _drive_wizard_paths(monkeypatch, [*two_files, gone],
+                                        {"(1/2/3/4)": "3"})
+
+        out = capsys.readouterr().out
+        assert result is not None
+        assert "deleted-meanwhile.jpg" in out, "a vanished selection must not be dropped silently"

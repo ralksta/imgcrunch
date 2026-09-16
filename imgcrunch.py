@@ -98,7 +98,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 EXT_TO_FORMAT = {
-    '.jpg': 'jpeg', '.jpeg': 'jpeg', '.png': 'jpeg', '.bmp': 'jpeg',
+    '.jpg': 'jpeg', '.jpeg': 'jpeg', '.png': 'webp', '.bmp': 'jpeg',
     '.tiff': 'jpeg', '.tif': 'jpeg', '.webp': 'webp', '.gif': 'webp',
     '.heic': 'heic', '.heif': 'heic',
     '.avif': 'avif', '.jxl': 'jxl',
@@ -626,6 +626,14 @@ def process_image(
                         background = Image.new('RGB', img.size, (255, 255, 255))
                         if img.mode == 'P':
                             img = img.convert('RGBA')
+                        # Only real transparency is lost here - an alpha channel
+                        # that is opaque everywhere flattens to the same pixels.
+                        if img.getchannel('A').getextrema()[0] < 255:
+                            note = (f"transparency flattened onto white \u2014 "
+                                    f"{format_key.upper()} has no alpha channel; "
+                                    f"webp, avif or jxl would keep it")
+                            result.warning = (f"{result.warning}; {note}"
+                                              if result.warning else note)
                         background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
                         img = background
                 elif img.mode != 'RGB' and not (supports_alpha and img.mode == 'RGBA'):
@@ -742,10 +750,23 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     # 1. Resolve inputs
     input_paths = []
     if prefills:
+        missing = []
         for p in prefills:
             resolved = Path(p).expanduser().resolve()
             if resolved.exists():
                 input_paths.append(resolved)
+            else:
+                missing.append(resolved)
+        # A Finder selection whose files moved or vanished used to shrink
+        # without a word ("Found 4 input item(s)" for five selected).
+        if missing:
+            print(f"  {C.YELLOW}\u26a0\ufe0f  {len(missing)} of {len(prefills)} selected "
+                  f"item(s) no longer exist and were skipped:{C.RESET}")
+            for m in missing[:5]:
+                print(f"    {C.DIM}{m}{C.RESET}")
+            if len(missing) > 5:
+                print(f"    {C.DIM}\u2026 and {len(missing) - 5} more{C.RESET}")
+            print()
 
     if not input_paths:
         print(f"  {C.BOLD}Enter the path to the folder containing your images:{C.RESET}")
@@ -897,12 +918,13 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     if max_px is None:
         print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
         print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
-        print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
+        print(f"  {C.DIM}(press Enter for {DEFAULT_MAX_SIZE}px, the same default as the "
+              f"command line; 0 = no resizing){C.RESET}")
         print()
         while True:
-            size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
+            size_input = input(f"  Max longest side [{C.CYAN}{DEFAULT_MAX_SIZE}{C.RESET}]: ").strip()
             if not size_input:
-                max_px = 0
+                max_px = DEFAULT_MAX_SIZE
                 break
             try:
                 max_px = int(size_input)
