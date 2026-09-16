@@ -1,3 +1,2 @@
-# Development dependencies (test suite)
--r requirements.txt
-pytest>=8.0
+# Development dependencies (test suite) - defined in pyproject.toml.
+-e .[dev]

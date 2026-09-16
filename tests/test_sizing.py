@@ -1,14 +1,10 @@
 """Tests for sizing.py — pure geometry and search logic, no image files."""
 
 import math
-import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import sizing  # noqa: E402
+import sizing
 
 
 class TestNeedsResize:

@@ -36,14 +36,34 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 
 ## 🚀 Installation & Quick Start
 
-### 1. Clone & Set Up the Environment
+### 1. Install
+
+**Recommended — [pipx](https://pipx.pypa.io)**, which puts `imgcrunch` on your `PATH` in its own environment:
 ```bash
 git clone https://github.com/ralksta/imgcrunch.git
+pipx install './imgcrunch[all]'
+imgcrunch --version
+```
+
+Pillow is the only hard requirement and already covers JPEG, WebP and AVIF. The extras add the rest; `all` installs every one of them:
+
+| Extra | Adds |
+| :--- | :--- |
+| `heic` | HEIC output (`pillow-heif`) |
+| `jxl` | JPEG XL output (`pillow-jxl-plugin`) |
+| `exif` | Keeps EXIF dimension tags accurate after a JPEG resize (`piexif`) |
+| `progress` | Progress bar (`tqdm`) |
+
+Choose a format whose extra is missing and ImgCrunch stops before the first image and names the package to install.
+
+**Alternative — a venv inside the clone**, which is what `resize.sh` uses:
+```bash
 cd imgcrunch
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt     # installs the project with all extras
 ```
+Requires Python 3.11 or newer.
 
 ### 2. Install macOS Finder Quick Action
 To process images directly from Finder:

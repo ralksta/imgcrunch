@@ -14,9 +14,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import imgcrunch as ic  # noqa: E402
+import imgcrunch as ic
 
 
 def job(format_key="jpeg", quality=85, max_size=3000, **kwargs):
@@ -26,16 +24,6 @@ def job(format_key="jpeg", quality=85, max_size=3000, **kwargs):
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-@pytest.fixture(autouse=True)
-def isolated_config(tmp_path, monkeypatch):
-    """
-    Every run remembers its settings in ~/.config/imgcrunch. Point that at a
-    temp dir so the suite never reads or overwrites the real one - including
-    from the CLI subprocesses, which inherit this environment.
-    """
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -208,11 +196,9 @@ class TestProcessImage:
 
     def test_strip_removes_exif(self, tmp_path):
         # Build a jpeg carrying an EXIF orientation tag, then strip it.
-        import piexif
         src = tmp_path / "src.jpg"
         _make_image(src, size=(400, 300))
-        exif_dict = {"0th": {piexif.ImageIFD.Orientation: 6}}
-        piexif.insert(piexif.dump(exif_dict), str(src))
+        _tag_orientation(src, 6)   # Pillow writes the tag; no piexif needed
 
         out = tmp_path / "out.jpg"
         res = ic.process_image(str(src), str(out), job(strip_exif=True))
@@ -223,17 +209,23 @@ class TestProcessImage:
     def test_strip_bakes_orientation(self, tmp_path):
         # Orientation 6 = rotate 90deg. A 400x300 image tagged '6' should,
         # after stripping, have its pixels physically rotated to 300x400.
-        import piexif
         src = tmp_path / "src.jpg"
         _make_image(src, size=(400, 300))
-        exif_dict = {"0th": {piexif.ImageIFD.Orientation: 6}}
-        piexif.insert(piexif.dump(exif_dict), str(src))
+        _tag_orientation(src, 6)   # Pillow writes the tag; no piexif needed
 
         out = tmp_path / "out.jpg"
         res = ic.process_image(str(src), str(out), job(strip_exif=True))
         assert res.error is None
         with Image.open(out) as im:
             assert im.size == (300, 400), "orientation must be baked into pixels"
+
+
+def _tag_orientation(path, value):
+    """Rewrite a JPEG with an EXIF orientation tag, using Pillow only."""
+    with Image.open(path) as im:
+        exif = Image.Exif()
+        exif[0x0112] = value
+        im.save(path, exif=exif.tobytes())
 
 
 # ── CLI integration: rename numbering has no gaps around dupes ────────────────
@@ -1190,6 +1182,8 @@ class TestRefreshQuicklook:
 
 class TestExifFailureIsReported:
     def test_unreadable_exif_produces_a_warning(self, tmp_path, monkeypatch):
+        # This failure path only exists when piexif parses the EXIF block.
+        pytest.importorskip("piexif")
         src = tmp_path / "a.jpg"
         Image.new("RGB", (900, 700), (1, 2, 3)).save(src)
 
@@ -1936,3 +1930,38 @@ class TestWorkersFlag:
 
     def test_default_is_one_per_core(self):
         assert ic.parse_cli(["x"]).workers is None     # resolved to MAX_WORKERS in main()
+
+
+
+# ── Packaging: version, entry point, honest install hints ────────────────────
+
+class TestPackaging:
+    def test_version_flag(self):
+        r = subprocess.run([sys.executable, str(REPO_ROOT / "imgcrunch.py"), "--version"],
+                           capture_output=True, text=True, timeout=60)
+
+        assert r.returncode == 0
+        assert r.stdout.strip() == f"imgcrunch {ic.__version__}"
+
+    def test_cli_entry_point_handles_ctrl_c_before_the_batch(self, monkeypatch, capsys):
+        # The console script calls cli(), not the __main__ block, so the
+        # interrupt fallback has to live there.
+        def interrupted():
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ic, "main", interrupted)
+
+        with pytest.raises(SystemExit) as exc:
+            ic.cli()
+
+        assert exc.value.code == 0
+        assert "nothing was changed" in capsys.readouterr().out.lower()
+
+    def test_avif_hint_does_not_point_at_pillow_heif(self):
+        # Pillow encodes AVIF itself since 11.3; pillow-heif is for HEIC only.
+        assert "pillow-heif" not in ic.ENCODER_HINTS["avif"]
+        assert "Pillow" in ic.ENCODER_HINTS["avif"]
+
+    def test_heic_and_jxl_hints_name_their_plugins(self):
+        assert "pillow-heif" in ic.ENCODER_HINTS["heic"]
+        assert "pillow-jxl-plugin" in ic.ENCODER_HINTS["jxl"]

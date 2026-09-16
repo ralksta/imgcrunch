@@ -4,20 +4,9 @@ Tests for presets.py: built-in presets and the remembered last run.
 Pure module - no Pillow, no encoding - so these run in milliseconds.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import presets  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def isolated_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-    return tmp_path / "xdg"
+import presets
 
 
 class TestConfigPath:

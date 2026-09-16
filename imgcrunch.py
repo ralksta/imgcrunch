@@ -6,6 +6,8 @@ Supports JPEG, HEIC, AVIF, and WebP output formats.
 Preserves EXIF metadata. Parallel processing with progress bar.
 """
 
+__version__ = "1.1.0.dev0"
+
 import argparse
 import hashlib
 import io
@@ -201,7 +203,7 @@ def format_bytes(size_bytes: int) -> str:
 # Install hints per format, used when the encoder probe fails.
 ENCODER_HINTS = {
     'heic': 'pip install pillow-heif',
-    'avif': 'pip install pillow-heif',
+    'avif': "pip install -U 'Pillow>=11.3'  (AVIF is built into Pillow)",
     'jxl':  'pip install pillow-jxl-plugin',
 }
 
@@ -1636,6 +1638,8 @@ Examples:
     parser.add_argument('--workers', type=_positive_int, default=None, metavar='N',
                         help=f'Parallel encoder processes (default: one per core, '
                              f'{MAX_WORKERS} here). Lower it to keep the machine usable.')
+    parser.add_argument('--version', action='version',
+                        version=f'imgcrunch {__version__}')
     parser.add_argument('--quiet', action='store_true',
                         help='Print only errors — no config table, progress '
                              'bar or summary')
@@ -2283,12 +2287,23 @@ def main():
             print(f"\n  {C.BOLD}Outputs saved to respective '<folder>/converted/' directories.{C.RESET}\n")
 
 
-if __name__ == '__main__':
+def cli() -> None:
+    """
+    Console-script entry point (see pyproject.toml).
+
+    An interrupt during the batch is handled inside main(), where the counters
+    are. One that arrives earlier - in the wizard, while scanning - lands here,
+    and at that point nothing has been touched yet.
+    """
     try:
         main()
     except KeyboardInterrupt:
         print()
         print(f"  {C.DIM}Cancelled — nothing was changed.{C.RESET}")
-        print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you're ready. 👋{C.RESET}")
         print()
         sys.exit(0)
+
+
+if __name__ == '__main__':
+    cli()
