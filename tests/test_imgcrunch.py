@@ -7,6 +7,7 @@ integration tests (generate real images with Pillow into tmp dirs).
 
 import gc
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -2047,7 +2048,7 @@ class TestWorkerCrash:
 class TestModernFormats:
     @pytest.mark.parametrize("fmt, plugin, pil_name, keeps_alpha", [
         ("avif", None,           "AVIF", True),
-        ("heic", "pillow_heif",  "HEIF", False),
+        ("heic", "pillow_heif",  "HEIF", True),
         ("jxl",  "pillow_jxl",   "JXL",  True),
     ])
     def test_round_trip(self, tmp_path, fmt, plugin, pil_name, keeps_alpha):
@@ -2265,7 +2266,7 @@ class TestTransparentCopyThrough:
         img.save(path, ic.FORMAT_CONFIG[fmt]["pillow_format"], quality=90)
 
     @pytest.mark.parametrize("fmt, plugin", [("avif", None), ("webp", None),
-                                             ("jxl", "pillow_jxl")])
+                                             ("jxl", "pillow_jxl"), ("heic", "pillow_heif")])
     def test_same_format_is_copied_byte_for_byte(self, tmp_path, fmt, plugin):
         ext = ic.FORMAT_CONFIG[fmt]["extension"]
         src = tmp_path / f"in{ext}"
@@ -2299,3 +2300,56 @@ class TestTransparentCopyThrough:
         assert res.skipped is False
         with Image.open(out) as im:
             assert im.mode == "RGB"
+
+
+
+# ── HEIC stores transparency; it must not be flattened like JPEG ─────────────
+
+class TestHeicTransparency:
+    """
+    HEIC was treated as a format without alpha, so a transparent PNG converted
+    to HEIC came out on a white background and a transparent HEIC was flattened
+    even when converted to HEIC. HEIC stores an alpha plane, pillow-heif writes
+    it, and macOS ImageIO - Preview, Finder, Photos - reads it.
+    """
+
+    def _transparent_png(self, path):
+        pytest.importorskip("pillow_heif")
+        img = Image.new("RGBA", (400, 300), (0, 120, 255, 255))
+        img.putalpha(Image.linear_gradient("L").resize((400, 300)))
+        img.save(path)
+
+    def test_transparent_png_into_heic_keeps_alpha_without_warning(self, tmp_path):
+        src = tmp_path / "logo.png"
+        self._transparent_png(src)
+        out = tmp_path / "logo.heic"
+
+        res = ic.process_image(str(src), str(out), job("heic"))
+
+        assert res.error is None, res.error
+        assert not res.warning, res.warning
+        with Image.open(out) as im:
+            im.load()
+            assert im.getchannel("A").getextrema() == (0, 255)
+
+    @pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("sips"),
+                        reason="needs macOS sips")
+    def test_macos_reads_the_alpha_channel(self, tmp_path):
+        src = tmp_path / "logo.png"
+        self._transparent_png(src)
+        out = tmp_path / "logo.heic"
+        ic.process_image(str(src), str(out), job("heic"))
+
+        r = subprocess.run(["sips", "-g", "hasAlpha", str(out)],
+                           capture_output=True, text=True, timeout=30)
+
+        assert "hasAlpha: yes" in r.stdout
+
+    def test_jpeg_still_flattens_and_says_so(self, tmp_path):
+        src = tmp_path / "logo.png"
+        self._transparent_png(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "logo.jpg"), job("jpeg"))
+
+        assert res.warning and "heic" in res.warning.lower(), \
+            "the warning should now name HEIC among the formats that keep alpha"

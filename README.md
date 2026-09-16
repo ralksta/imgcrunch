@@ -8,7 +8,7 @@ ImgCrunch is an extremely fast, parallel image processing command-line tool (CLI
 
 ### 📦 Multi-Format Power
 - **Modern Formates**: Convert to **JPEG**, **HEIC** (Apple standard), **AVIF** (next-gen), **WebP** (web-optimized), and **JPEG XL (JXL)**.
-- **Transparency Preservation**: Keeps the alpha channel (RGBA) intact when converting to formats that support transparency (WebP, AVIF, JXL).
+- **Transparency Preservation**: Keeps the alpha channel (RGBA) intact when converting to formats that support transparency (WebP, AVIF, JXL, HEIC). Only JPEG output is flattened onto white, with a warning.
 - **Lossless Mode**: `--lossless` flag for lossless AVIF and WebP outputs.
 - **Smart Quality**: Auto-tuned quality levels per output format to achieve the perfect balance between file size and visual fidelity.
 - **Target Size (`--target-size`)**: Force every output below a byte budget (`500k`, `1.5m`), on the command line or as a wizard step. Quality is lowered first; if that isn't enough, the image is scaled down until it fits. Files that can't reach the target are reported as errors instead of being written oversized. Cannot be combined with `--lossless` (no quality to trade) or `--format original` (no re-encoding). Does not apply to animated images (GIF→WebP/AVIF); those are written at normal quality with a warning. Note: When dimensions are reduced during the target-size search, EXIF `PixelXDimension` and `PixelYDimension` tags still describe the pre-shrink size (affects JPEG and other formats that preserve EXIF).
@@ -236,7 +236,7 @@ input-folder/
 **Wizard**
 
 - **Presets.** The wizard opens with *Last run*, *Web*, *Archive* and *Save space*; picking one answers the format, quality, size, byte-budget and metadata questions in one keystroke. The same recipes are available as `--preset NAME`, with explicitly typed flags taking precedence. Presets never carry a mode, so one can never switch on `--replace`.
-- **Transparency is no longer flattened in silence.** A folder of PNGs used to default to JPEG, painting every transparent pixel white. PNG now suggests WebP, and flattening real transparency into JPEG or HEIC produces a warning.
+- **Transparency is no longer flattened in silence.** A folder of PNGs used to default to JPEG, painting every transparent pixel white. PNG now suggests WebP, and flattening real transparency into JPEG produces a warning.
 - **Every option is reachable from the wizard.** *Choose each setting* now asks for quality, offers lossless for WebP and AVIF (skipping quality and byte budget, which it makes meaningless), and can skip duplicates. Answering `d` at the final prompt does a dry run on any path — presets and replace included.
 - **Same default everywhere.** Enter on the longest-side question now means 3000px, like the command line and this README; `0` still disables resizing.
 - **Vanished Finder selections are named** instead of silently shrinking the input list.
@@ -251,7 +251,8 @@ input-folder/
 - **`--args-file` fails honestly.** An unreadable file used to print a note and carry on with the flag still in `argv`, which then produced the baffling “`--args-file` cannot be combined with `--wizard`”. It now exits with the real reason.
 - **Unreadable EXIF is reported** instead of being dropped in silence, and the Quick Look refresh no longer runs `qlmanage -r cache`, which threw away Quick Look thumbnails for every file on the machine.
 - **`--quiet`** prints errors and nothing else.
-- **Transparent AVIF, WebP and JPEG XL files are no longer re-encoded into their own format.** The copy-through rule only admitted images without an alpha channel — a rule meant for JPEG and HEIC — so converting a folder of transparent AVIFs to AVIF recompressed every one of them. They are now copied byte for byte like any other file that needs no change.
+- **HEIC keeps transparency.** It was treated as a format without alpha, so a transparent PNG converted to HEIC came out on white, and so did a transparent HEIC converted to HEIC. HEIC stores an alpha plane and macOS reads it; only JPEG output is flattened now.
+- **Transparent AVIF, WebP and JPEG XL files are no longer re-encoded into their own format.** The copy-through rule only admitted images without an alpha channel — a rule meant for JPEG — so converting a folder of transparent AVIFs to AVIF recompressed every one of them. They are now copied byte for byte like any other file that needs no change.
 - **The exit code reports failures.** It was 0 even when images failed; it is now 1 whenever an image, or a replace, move or post-hook after it, failed — which is what makes `--quiet` usable in scripts.
 
 - **Target Size (`--target-size`)** – Force every output below a byte budget (`500k`, `1.5m`). Quality is binary-searched first, capped at the requested `--quality`; if no quality fits, dimensions are reduced until one does, preserving aspect ratio and never upscaling. Files that cannot reach the target are reported as errors rather than written oversized. Available on the command line and as a wizard step.

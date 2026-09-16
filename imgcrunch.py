@@ -117,9 +117,10 @@ FORMAT_CONFIG = {
     'jxl':  {'extension': '.jxl',  'pillow_format': 'JXL',  'extra_opts': {}},
 }
 
-# Output formats that store an alpha channel. JPEG and HEIC output is flattened
-# onto white; see process_image.
-ALPHA_FORMATS = ('webp', 'avif', 'jxl')
+# Output formats that store an alpha channel. Only JPEG output is flattened
+# onto white; see process_image. HEIC keeps an alpha plane, which pillow-heif
+# writes and macOS ImageIO (Preview, Finder, Photos) reads.
+ALPHA_FORMATS = ('webp', 'avif', 'jxl', 'heic')
 
 IS_MACOS = sys.platform == 'darwin'
 
@@ -564,8 +565,8 @@ def process_image(
             # nothing about this particular image does either. Copy straight
             # through — zero generational loss.
             # A file already in an alpha-capable target format can keep its
-            # alpha channel as it is; only JPEG and HEIC output needs RGB or L,
-            # because transparency there has to be flattened.
+            # alpha channel as it is; only JPEG output needs RGB or L, because
+            # transparency there has to be flattened.
             copyable_modes = ('RGB', 'L', 'RGBA', 'LA') if format_key in ALPHA_FORMATS \
                 else ('RGB', 'L')
             if already_target and not settings.forces_reencode() \
@@ -660,14 +661,14 @@ def process_image(
             else:
                 # Handle Static Image
                 # Mode conversion
-                # Keep RGBA/LA/P transparency if output format supports alpha (webp, avif, jxl)
+                # Keep RGBA/LA/P transparency if output format supports alpha (webp, avif, jxl, heic)
                 supports_alpha = format_key in ALPHA_FORMATS
                 if img.mode in ('RGBA', 'LA', 'P'):
                     if supports_alpha:
                         if img.mode != 'RGBA':
                             img = img.convert('RGBA')
                     else:
-                        # Convert to RGB with white background for JPEG/HEIC
+                        # Convert to RGB with white background for JPEG
                         background = Image.new('RGB', img.size, (255, 255, 255))
                         if img.mode == 'P':
                             img = img.convert('RGBA')
@@ -676,7 +677,7 @@ def process_image(
                         if img.getchannel('A').getextrema()[0] < 255:
                             note = (f"transparency flattened onto white \u2014 "
                                     f"{format_key.upper()} has no alpha channel; "
-                                    f"webp, avif or jxl would keep it")
+                                    f"webp, avif, jxl or heic would keep it")
                             result.warning = (f"{result.warning}; {note}"
                                               if result.warning else note)
                         background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
