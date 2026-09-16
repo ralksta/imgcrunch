@@ -28,6 +28,7 @@ from typing import Optional
 # imgcrunch.needs_resize / imgcrunch.calculate_new_size. Also imported as a
 # module (below) so the target-size worker path can call sizing.search_quality
 # / sizing.search_scale / sizing.parse_size directly.
+import presets
 import sizing
 from sizing import calculate_new_size, needs_resize  # noqa: F401
 
@@ -746,6 +747,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     format_key: Optional[str] = None
     max_px       = None
     target_bytes = None
+    quality_pick: Optional[int]  = None
+    strip_mode:   Optional[bool] = None
+    lossless     = False
+    preset_used  = False
 
     # 1. Resolve inputs
     input_paths = []
@@ -874,7 +879,46 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Keep originals{C.RESET}")
         print()
 
-    # 3. Format (if not copy-only)
+    # 3. Preset - answers format, quality, size, budget and metadata at once.
+    # Only offered when there is something to encode; a preset never sets the
+    # mode, so it cannot be the step that turns on replace.
+    if format_key is None:
+        choices = []
+        last = presets.load_last_run()
+        if last:
+            choices.append(('Last run', last))
+        for builtin in presets.BUILTIN_PRESETS.values():
+            choices.append((builtin['label'], builtin))
+        custom_key = str(len(choices) + 1)
+        default_key = '1' if last else custom_key
+
+        print(f"  {C.BOLD}How should the images be encoded?{C.RESET}")
+        print()
+        for i, (label, settings) in enumerate(choices, start=1):
+            print(f"    [{C.CYAN}{i}{C.RESET}]  {label:<12} {C.DIM}\u2014 "
+                  f"{presets.describe(settings)}{C.RESET}")
+        print(f"    [{C.CYAN}{custom_key}{C.RESET}]  Choose each setting \u2026")
+        print()
+        while True:
+            pick = input(f"  Preset (1-{custom_key}) [{C.CYAN}{default_key}{C.RESET}]: "
+                         ).strip() or default_key
+            if pick.isdigit() and 1 <= int(pick) <= int(custom_key):
+                break
+            print(f"  {C.YELLOW}\u26a0\ufe0f  Please enter a number from 1 to {custom_key}.{C.RESET}")
+
+        if pick != custom_key:
+            label, chosen = choices[int(pick) - 1]
+            format_key   = chosen['format']
+            quality_pick = chosen['quality']
+            max_px       = chosen['max_size']
+            target_bytes = chosen['target_size']
+            strip_mode   = chosen['strip']
+            lossless     = chosen['lossless']
+            preset_used  = True
+            print(f"  {C.GREEN}\u2705  {label}: {presets.describe(chosen)}{C.RESET}")
+            print()
+
+    # 4. Format (if not copy-only and no preset)
     if format_key is None:
         format_keys    = ['jpeg', 'heic', 'avif', 'webp', 'jxl']
         detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else None
@@ -901,11 +945,12 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         format_key = format_options[choice][0]
 
     if format_key != 'original' and not rename_only:
-        default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
+        default_quality = quality_pick or FORMAT_QUALITY_DEFAULTS[format_key]
         # Whether the format is actually encodable (not just importable) is
         # decided by probe_encoder() in main() before the batch starts — no
         # need to duplicate a weaker import-only check here.
-        print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
+        if not preset_used:
+            print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
         default_quality = None
         if rename_only:
@@ -914,7 +959,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
     print()
 
-    # 4. Max longest side (if not copy-only)
+    # 5. Max longest side (if not copy-only)
     if max_px is None:
         print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
         print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
@@ -943,11 +988,11 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Max size: {max_px}px{C.RESET}")
         print()
 
-    # 5. Max file size (only when we actually re-encode)
+    # 6. Max file size (only when we actually re-encode)
     # A byte budget needs something to trade away, so it is only offered when
     # a real output format was chosen. That also makes the CLI's --target-size
     # conflicts (--format original, --lossless) unreachable from here.
-    if format_key != 'original' and not rename_only:
+    if format_key != 'original' and not rename_only and not preset_used:
         print(f"  {C.BOLD}What should the max file size per image be?{C.RESET}")
         print(f"  {C.DIM}Quality is lowered first, then dimensions if needed.{C.RESET}")
         print(f"  {C.DIM}e.g. 500k, 1.5m  (press Enter for no limit){C.RESET}")
@@ -973,7 +1018,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Max file size: {format_bytes(parsed)}{C.RESET}")
         print()
 
-    # 6. Rename (keep mode, merge mode, or the whole point in rename-only mode)
+    # 7. Rename (keep mode, merge mode, or the whole point in rename-only mode)
     rename_base = None
     if rename_only:
         print(f"  {C.BOLD}What should the new base name be?{C.RESET}")
@@ -1013,9 +1058,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             rename_base = None
         print()
 
-    # 7. Privacy Mode (EXIF stripping) — not applicable when only renaming
-    strip_mode = False
-    if not rename_only:
+    # 8. Privacy Mode (EXIF stripping) — not applicable when only renaming
+    if rename_only:
+        strip_mode = False
+    elif strip_mode is None:
         print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
         print(f"  {C.DIM}This removes GPS coordinates, camera model, etc.{C.RESET}")
         print()
@@ -1072,7 +1118,12 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.BOLD}Mode:{C.RESET}         {'⚠️  Replace in-place' if replace_mode else '📂  Keep originals'}")
     print(f"  {C.BOLD}Format:{C.RESET}       {format_key.upper()}")
     if default_quality:
-        print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}(smart default for {format_key.upper()}){C.RESET}")
+        if lossless:
+            print(f"  {C.BOLD}Quality:{C.RESET}      lossless")
+        else:
+            origin = ("from preset" if preset_used
+                      else f"smart default for {format_key.upper()}")
+            print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}({origin}){C.RESET}")
     print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if max_px == 0 else f'{max_px}px'}")
     if target_bytes:
         print(f"  {C.BOLD}Max file size:{C.RESET} {format_bytes(sizing.parse_size(target_bytes))}")
@@ -1118,7 +1169,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'rename_only':   False,
         'replace':       replace_mode,
         'target_size':   target_bytes,
-        'lossless':      False,
+        'lossless':      lossless,
         'skip_dupes':    False,
         'post_hook':     None,
         'merge':         merge_mode,
@@ -1475,6 +1526,11 @@ Examples:
                         help='Merge all input folders/files into a single output folder')
     parser.add_argument('--dry-run', action='store_true', dest='dry_run',
                         help='Show what would be processed without writing anything')
+    parser.add_argument('--preset', metavar='NAME', default=None,
+                        choices=['last', *presets.BUILTIN_PRESETS],
+                        help='Start from a saved recipe: '
+                             + ', '.join(['last', *presets.BUILTIN_PRESETS])
+                             + '. Flags given explicitly still win.')
     parser.add_argument('--quiet', action='store_true',
                         help='Print only errors — no config table, progress '
                              'bar or summary')
@@ -1482,6 +1538,33 @@ Examples:
                         help='Skip the confirmation prompt for --replace '
                              'and --rename-only')
     return parser
+
+
+def parse_cli(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """
+    Parse the command line, applying --preset underneath explicit flags.
+
+    argparse cannot tell a default from a value the user typed, so the preset
+    is installed as the parser's *defaults* and the line is parsed again:
+    anything given explicitly then overrides it, exactly as with the built-in
+    defaults.
+    """
+    parser = build_parser()
+    first, _ = parser.parse_known_args(argv)
+    if first.preset:
+        if first.preset == 'last':
+            chosen = presets.load_last_run()
+            if chosen is None:
+                parser.error("--preset last: no previous run is remembered yet "
+                             "\u2014 finish one conversion first")
+        else:
+            chosen = presets.BUILTIN_PRESETS[first.preset]
+        parser.set_defaults(
+            format=chosen['format'], quality=chosen['quality'],
+            max_size=chosen['max_size'], target_size=chosen['target_size'],
+            strip=chosen['strip'], lossless=chosen['lossless'],
+        )
+    return parser.parse_args(argv)
 
 
 def main():
@@ -1532,8 +1615,7 @@ def main():
             sys.exit(0)
         args = argparse.Namespace(**wizard_result)
     else:
-        parser = build_parser()
-        args = parser.parse_args()
+        args = parse_cli()
 
     # Resolve quality
     quality = getattr(args, 'quality', None)
@@ -2029,6 +2111,23 @@ def main():
     # macOS Quick Look refresh (#22)
     if IS_MACOS and output_paths_written:
         refresh_quicklook(output_paths_written)
+
+    # Remember what was used, so the wizard can offer it as "Last run". Dry
+    # runs, rename-only and interrupted runs never get this far; a plain copy
+    # has no encoding settings worth reusing.
+    if args.format != 'original':
+        try:
+            presets.save_last_run({
+                'format':      args.format,
+                'quality':     args.quality,
+                'max_size':    args.max_size,
+                'target_size': target_size_arg,
+                'strip':       strip,
+                'lossless':    lossless,
+            })
+        except OSError:
+            # A convenience for next time; never fail a finished batch over it.
+            pass
 
     if quiet:
         # Nothing went wrong worth interrupting a script for, so say nothing.

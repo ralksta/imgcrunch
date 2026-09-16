@@ -26,6 +26,16 @@ def job(format_key="jpeg", quality=85, max_size=3000, **kwargs):
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    """
+    Every run remembers its settings in ~/.config/imgcrunch. Point that at a
+    temp dir so the suite never reads or overwrites the real one - including
+    from the CLI subprocesses, which inherit this environment.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
 # ── Pure helpers ─────────────────────────────────────────────────────────────
 
 class TestCalculateNewSize:
@@ -1396,3 +1406,175 @@ class TestWizardNamesVanishedSelections:
         out = capsys.readouterr().out
         assert result is not None
         assert "deleted-meanwhile.jpg" in out, "a vanished selection must not be dropped silently"
+
+
+class TestPresetFormatsMatchTheEncoder:
+    def test_presets_know_exactly_the_encodable_formats(self):
+        import presets
+        # presets.py duplicates the list to stay Pillow-free; this keeps it honest.
+        assert set(presets.VALID_FORMATS) == set(ic.FORMAT_CONFIG)
+
+
+# ── Presets in the wizard ────────────────────────────────────────────────────
+
+class TestWizardPresets:
+    ENCODING_PROMPTS = ("1/2/3/4/5", "max longest side", "max file size", "strip metadata")
+
+    def _asked(self, seen, needle):
+        return any(needle in p for p in seen)
+
+    def test_enter_without_a_last_run_keeps_the_guided_path(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result is not None
+        assert self._asked(seen, "preset")
+        for prompt in self.ENCODING_PROMPTS:
+            assert self._asked(seen, prompt), f"guided path should still ask: {prompt}"
+
+    def test_picking_a_builtin_skips_the_encoding_questions(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir, {"preset": "1"})
+
+        assert result["format"] == "jpeg"
+        assert result["max_size"] == 2000
+        assert result["target_size"] == "500k"
+        assert result["strip"] is True
+        for prompt in self.ENCODING_PROMPTS:
+            assert not self._asked(seen, prompt), f"preset should skip: {prompt}"
+
+    def test_rename_is_still_asked_after_a_preset(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {"preset": "1", "base name": "trip"})
+
+        assert result["rename"] == "trip"
+
+    def test_last_run_is_offered_first_and_is_the_default(self, monkeypatch, wizard_dir):
+        import presets
+        presets.save_last_run({"format": "avif", "quality": 55, "max_size": 2400,
+                               "target_size": "800k", "strip": True, "lossless": False})
+
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["format"] == "avif"
+        assert result["quality"] == 55
+        assert result["max_size"] == 2400
+        assert result["target_size"] == "800k"
+
+    def test_a_preset_never_switches_on_replace(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"preset": "1"})
+
+        assert result["replace"] is False
+
+
+class TestLastRunIsRemembered:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (2400, 1600), (9, 90, 180)).save(src / "a.jpg")
+        return src
+
+    def test_a_finished_run_is_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "-f", "webp", "-q", "70", "-m", "1500",
+                      "--strip", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert presets.load_last_run() == {
+            "format": "webp", "quality": 70, "max_size": 1500,
+            "target_size": None, "strip": True, "lossless": False,
+        }
+
+    def test_dry_run_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "-f", "webp", "--dry-run")
+
+        assert presets.load_last_run() is None
+
+    def test_copy_only_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "-f", "original", "--no-move")
+
+        assert presets.load_last_run() is None, "there is nothing to reuse from a copy"
+
+    def test_rename_only_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "--rename-only", "--rename", "x", "--yes")
+
+        assert presets.load_last_run() is None
+
+
+class TestPresetFlag:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (3000, 2000), (9, 90, 180)).save(src / "a.jpg", quality=98)
+        return src
+
+    def test_builtin_preset_sets_the_encoding(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        out = src / "converted" / "a.jpg"
+        with Image.open(out) as im:
+            assert max(im.size) == 2000
+        assert out.stat().st_size <= 500 * 1024
+
+    def test_an_explicit_flag_beats_the_preset(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-m", "800", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(src / "converted" / "a.jpg") as im:
+            assert max(im.size) == 800
+
+    def test_last_uses_the_remembered_run(self, tmp_path):
+        import presets
+        presets.save_last_run({"format": "webp", "quality": 60, "max_size": 1000,
+                               "target_size": None, "strip": False, "lossless": False})
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "last", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(src / "converted" / "a.webp") as im:
+            assert max(im.size) == 1000
+
+    def test_last_without_a_remembered_run_says_so(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "last")
+
+        assert r.returncode != 0
+        assert "no previous run" in (r.stdout + r.stderr).lower()
+
+    def test_unknown_preset_is_rejected(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "nope")
+
+        assert r.returncode != 0
+        # "web" would also match "webp" in the usage line; "archive" appears
+        # nowhere but in the list of valid preset names.
+        assert "archive" in r.stderr, "the error should list the valid names"

@@ -80,6 +80,20 @@ bash resize.sh
 ```
 The wizard asks its own questions, so it takes no flags — `--wizard` combined with any flag is rejected rather than silently ignored. Use the flags directly (below) when you want a non-interactive run.
 
+Instead of walking through every setting, the wizard first offers presets:
+
+```
+  How should the images be encoded?
+
+    [1]  Last run     — AVIF q55, 2400px, max 800k, EXIF stripped
+    [2]  Web          — JPEG q85, 2000px, max 500k, EXIF stripped
+    [3]  Archive      — JXL q90, original size, EXIF kept
+    [4]  Save space   — AVIF q60, 3000px, EXIF kept
+    [5]  Choose each setting …
+```
+
+*Last run* appears once you have finished a conversion; its settings live in `~/.config/imgcrunch/config.toml` (or under `$XDG_CONFIG_HOME`) and the file is safe to delete. A preset only ever sets how images are encoded — never replace, rename or merge — so picking one cannot be what overwrites your files.
+
 ### 2. CLI Mode (Automation)
 Ideal for scripting and automation:
 ```bash
@@ -133,6 +147,7 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--skip-dupes` | | Skip files that are content-identical to an already-processed file | off |
 | `--dry-run` | | Preview what would be processed without writing anything | off |
 | `--yes` | `-y` | Skip the confirmation prompt for `--replace` and `--rename-only` | off |
+| `--preset NAME` | | Start from a recipe: `web`, `archive`, `compact`, or `last` (the settings of your previous run). Flags you type explicitly still win. | off |
 | `--quiet` | | Print only errors — no config table, progress bar or summary | off |
 | `--args-file` | | *Internal.* Reads one argument per line from a file, then deletes it. The macOS Quick Action uses this to hand over a Finder selection. | off |
 
@@ -164,6 +179,13 @@ input-folder/
 
 ### Unreleased
 *Everything below has landed on `main` since the v1.0.0 tag.*
+
+**Wizard**
+
+- **Presets.** The wizard opens with *Last run*, *Web*, *Archive* and *Save space*; picking one answers the format, quality, size, byte-budget and metadata questions in one keystroke. The same recipes are available as `--preset NAME`, with explicitly typed flags taking precedence. Presets never carry a mode, so one can never switch on `--replace`.
+- **Transparency is no longer flattened in silence.** A folder of PNGs used to default to JPEG, painting every transparent pixel white. PNG now suggests WebP, and flattening real transparency into JPEG or HEIC produces a warning.
+- **Same default everywhere.** Enter on the longest-side question now means 3000px, like the command line and this README; `0` still disables resizing.
+- **Vanished Finder selections are named** instead of silently shrinking the input list.
 
 **Safety and honest reporting**
 
