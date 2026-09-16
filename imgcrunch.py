@@ -81,6 +81,8 @@ C = Color
 # ── Configuration ────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_SIZE   = 3000
+# How far above the target size a JPEG is decoded before LANCZOS; see draft().
+JPEG_DRAFT_GAP     = 1.5
 OUTPUT_FOLDER_NAME = 'converted'
 MAX_WORKERS        = os.cpu_count() or 4
 
@@ -498,13 +500,41 @@ def process_image(
         with Image.open(input_path) as img:
             is_animated_gif = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
 
+            # True dimensions of the file, as displayed. Everything below sizes
+            # its decisions on these - never on img.size, which draft() shrinks.
+            width, height = img.size
+            will_transpose = strip_exif and not is_animated_gif
+            quarter_turn = (will_transpose
+                            and img.getexif().get(0x0112, 1) in (5, 6, 7, 8))
+            if quarter_turn:
+                width, height = height, width
+            result.original_size = (width, height)
+
+            # A JPEG that is about to be shrunk does not need decoding at full
+            # size: libjpeg can scale by 1/2, 1/4 or 1/8 in the DCT domain.
+            # draft() picks the strongest of those that keeps *both* edges at or
+            # above the box, so the box is built from the real target size - a
+            # square max_size box lets the short edge veto a scale the target
+            # allows.
+            #
+            # The box is JPEG_DRAFT_GAP times the target, not the target itself.
+            # When the DCT scale lands exactly on the target, it *is* the whole
+            # resample, and on fine texture that measured ~31 dB against a full
+            # decode; with 1.5x headroom LANCZOS does the last step and stays
+            # above 44 dB. The price is no speed-up for mild (< 1.5x) shrinks.
+            #
+            # It must run before anything loads the pixels - exif_transpose
+            # and convert() both do - or it silently does nothing. The file is
+            # still in stored orientation here, so a quarter turn swaps the box.
+            if img.format == 'JPEG' and needs_resize(width, height, max_size):
+                tw, th = calculate_new_size(width, height, max_size)
+                box = (int(tw * JPEG_DRAFT_GAP), int(th * JPEG_DRAFT_GAP))
+                img.draft(img.mode, box[::-1] if quarter_turn else box)
+
             # When stripping metadata, bake the EXIF orientation into the pixels
             # first — otherwise the output would silently appear rotated.
-            if strip_exif and not is_animated_gif:
+            if will_transpose:
                 img = ImageOps.exif_transpose(img)
-
-            width, height = img.size
-            result.original_size = (width, height)
 
             # Early bail-out: already target format, no resize, no mode conversion
             # needed, and no strip. Copy straight through to the output location so

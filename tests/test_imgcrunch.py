@@ -5,6 +5,8 @@ Covers pure helpers (fast) and a few end-to-end process_image / CLI
 integration tests (generate real images with Pillow into tmp dirs).
 """
 
+import gc
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1705,3 +1707,155 @@ class TestPresetFlagEdges:
 
         assert r.returncode == 0, r.stdout + r.stderr
         assert (src / "converted" / "a.webp").exists()
+
+
+# ── Worker must close the source file, not leave it to the garbage collector ─
+
+def _open_fds():
+    return len(os.listdir("/dev/fd"))
+
+
+class TestSourceHandleIsClosed:
+    """
+    A guard, not a bug fix. process_image rebinds `img` inside its `with`
+    block (exif_transpose, convert, resize); that is safe because `with`
+    keeps its own reference to the manager, so __exit__ still closes the
+    opened file. GC is paused so a future change that loses the handle -
+    the draft() work touches exactly this code - shows up as a leak here
+    instead of as "too many open files" on a big batch.
+    """
+
+    @pytest.mark.parametrize("kwargs", [
+        {"max_size": 400},                              # resize path
+        {"max_size": 400, "strip_exif": True},          # exif_transpose path
+        {"format_key": "webp", "max_size": 400},        # convert path
+    ])
+    def test_no_descriptor_survives_the_call(self, tmp_path, kwargs):
+        if not Path("/dev/fd").exists():
+            pytest.skip("needs /dev/fd")
+        src = tmp_path / "src.png"
+        _make_image(src, size=(1200, 900), color=(10, 200, 30, 128), mode="RGBA")
+        fmt = kwargs.pop("format_key", "jpeg")
+        settings = job(fmt, **kwargs)
+
+        gc.collect()
+        gc.disable()
+        try:
+            before = _open_fds()
+            for i in range(15):
+                res = ic.process_image(str(src), str(tmp_path / f"o{i}.{fmt}"), settings)
+                assert res.error is None, res.error
+            after = _open_fds()
+        finally:
+            gc.enable()
+
+        assert after <= before, f"{after - before} file descriptors leaked"
+
+
+# ── draft(): decode large JPEGs at a reduced scale when they get shrunk ──────
+
+def _decoded_sizes(monkeypatch):
+    """Record the pixel size Pillow actually decodes at, calling the real loader."""
+    from PIL import ImageFile
+    seen = []
+    real_load = ImageFile.ImageFile.load
+
+    def spy(self):
+        if self.format == "JPEG" and getattr(self, "tile", None):
+            seen.append(self.size)
+        return real_load(self)
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", spy)
+    return seen
+
+
+def _psnr(a, b):
+    import math
+    from PIL import ImageChops, ImageStat
+    diff = ImageChops.difference(a.convert("RGB"), b.convert("RGB"))
+    mse = sum(v * v for v in ImageStat.Stat(diff).rms) / 3
+    return float("inf") if mse == 0 else 20 * math.log10(255 / math.sqrt(mse))
+
+
+def _photo(path, size=(4000, 3000), exif=None):
+    from PIL import ImageFilter
+    w, h = size
+    # Unblurred noise stands in for fine texture (foliage, fabric): the content
+    # where scaling in the DCT domain alone does visibly worse than LANCZOS.
+    base = Image.linear_gradient("L").resize(size)
+    noise = Image.effect_noise(size, 50)
+    img = Image.merge("RGB", (Image.blend(base, noise, 0.3), base, noise))
+    img.save(path, quality=92, **({"exif": exif} if exif else {}))
+
+
+class TestJpegDraftDecode:
+    def test_large_jpeg_is_decoded_below_full_size(self, tmp_path, monkeypatch):
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        decoded = _decoded_sizes(monkeypatch)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=1000))
+
+        assert res.error is None
+        assert decoded, "the JPEG loader never ran"
+        assert decoded[0][0] < 4000, f"decoded at full size {decoded[0]}"
+
+    def test_decode_keeps_headroom_above_the_target(self, tmp_path, monkeypatch):
+        # Target 450x337. 1/8 (500x375) would cover it, but leaves LANCZOS almost
+        # nothing to work with; the 1.5x gap asks for >= 675x505, which is 1/4.
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        decoded = _decoded_sizes(monkeypatch)
+
+        ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=450))
+
+        assert decoded[0] == (1000, 750), decoded
+
+    def test_no_reduction_when_nothing_is_resized(self, tmp_path, monkeypatch):
+        src = tmp_path / "small.jpg"
+        _photo(src, size=(1600, 1200))
+        decoded = _decoded_sizes(monkeypatch)
+
+        ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", max_size=3000))
+
+        assert decoded[0] == (1600, 1200)
+
+    def test_output_size_and_reported_original_are_exact(self, tmp_path):
+        src = tmp_path / "big.jpg"
+        _photo(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=1000))
+
+        assert res.original_size == (4000, 3000), "must report the file, not the draft"
+        assert res.new_size == (1000, 750)
+        with Image.open(tmp_path / "o.jpg") as im:
+            assert im.size == (1000, 750)
+
+    @pytest.mark.parametrize("target", [2000, 1600, 1000, 450])
+    def test_quality_matches_a_full_decode(self, tmp_path, target):
+        # 2000 is the hard case: 1/2 lands exactly on the target, so without
+        # headroom the DCT scaling alone would be the whole resample (~38 dB).
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        ic.process_image(str(src), str(tmp_path / "o.webp"),
+                         job("webp", max_size=target, lossless=True))
+        with Image.open(src) as full:
+            reference = full.convert("RGB").resize(
+                ic.calculate_new_size(4000, 3000, target), Image.Resampling.LANCZOS)
+
+        with Image.open(tmp_path / "o.webp") as out:
+            assert _psnr(out, reference) >= 44
+
+    def test_rotated_jpeg_with_strip_keeps_portrait_dimensions(self, tmp_path):
+        exif = Image.Exif()
+        exif[0x0112] = 6                       # rotate 90 CW on display
+        src = tmp_path / "rot.jpg"
+        _photo(src, exif=exif.tobytes())
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"),
+                               job(max_size=1000, strip_exif=True))
+
+        assert res.error is None
+        assert res.original_size == (3000, 4000)
+        with Image.open(tmp_path / "o.jpg") as im:
+            assert im.size == (750, 1000)
