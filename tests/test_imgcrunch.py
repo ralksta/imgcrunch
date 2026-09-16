@@ -1653,3 +1653,55 @@ class TestWizardDryRunFromConfirmation:
         result, _ = _drive_wizard(monkeypatch, wizard_dir)
 
         assert result["dry_run"] is False
+
+
+class TestPresetFlagEdges:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (1200, 800), (9, 90, 180)).save(src / "a.jpg")
+        return src
+
+    def test_no_strip_overrides_a_stripping_preset(self):
+        args = ic.parse_cli(["x", "--preset", "web", "--no-strip"])
+
+        assert args.strip is False
+
+    def test_no_strip_alone_leaves_the_default(self):
+        assert ic.parse_cli(["x"]).strip is False
+        assert ic.parse_cli(["x", "--strip"]).strip is True
+
+    def test_lossless_drops_the_presets_byte_budget(self):
+        # The user never typed --target-size; the preset's budget must yield
+        # instead of producing an error about a flag nobody gave.
+        args = ic.parse_cli(["x", "--preset", "web", "-f", "webp", "--lossless"])
+
+        assert args.target_size is None
+
+    def test_format_original_drops_the_presets_byte_budget(self):
+        args = ic.parse_cli(["x", "--preset", "web", "-f", "original"])
+
+        assert args.target_size is None
+
+    def test_an_explicit_budget_still_conflicts_with_lossless(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-f", "webp", "--lossless",
+                      "--target-size", "300k")
+
+        assert r.returncode != 0
+        assert "--target-size" in r.stdout + r.stderr
+
+    def test_preset_with_lossless_runs(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-f", "webp", "--lossless", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (src / "converted" / "a.webp").exists()

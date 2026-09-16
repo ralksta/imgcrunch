@@ -1573,6 +1573,11 @@ Examples:
                         help='Skip files that are content-identical to an already-processed file')
     parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
                         help='Strip EXIF metadata from output images (Privacy Mode)')
+    # SUPPRESS keeps --strip's False as the default; this flag exists so an
+    # explicit choice can undo a preset that strips.
+    parser.add_argument('--no-strip', action='store_false', dest='strip',
+                        default=argparse.SUPPRESS,
+                        help='Keep EXIF metadata even if --preset would strip it')
     parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
                         help='Shell command to run after each file. '
                              'Use {in} and {out} as placeholders.')
@@ -1618,7 +1623,16 @@ def parse_cli(argv: Optional[list[str]] = None) -> argparse.Namespace:
             max_size=chosen['max_size'], target_size=chosen['target_size'],
             strip=chosen['strip'], lossless=chosen['lossless'],
         )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # A byte budget that came from the preset must yield to a flag the user
+    # did type and that rules budgets out. Otherwise `--preset web --lossless`
+    # fails with an error about --target-size, which nobody typed. A budget
+    # given explicitly is left alone and still conflicts, as it should.
+    if first.preset and first.target_size is None and args.target_size is not None:
+        if args.lossless or args.format == 'original' or args.rename_only:
+            args.target_size = None
+    return args
 
 
 def main():

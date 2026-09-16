@@ -142,12 +142,13 @@ bash resize.sh /path/to/images --post-hook 'echo Processed: {out}'
 | `--rename-only` | | Rename in-place only — no conversion, resize or copies. Requires `--rename`. Numbering follows filename order. | off |
 | `--lossless` | | Lossless encoding (AVIF and WebP only) | off |
 | `--strip` | | Strip all EXIF metadata from output images (Privacy Mode) | off |
+| `--no-strip` | | Keep EXIF metadata even when `--preset` would strip it | off |
 | `--merge` | | Merge all input folders/files into a single output folder | off |
 | `--post-hook CMD`| | Shell command to run after each file (placeholders: `{in}`, `{out}`) | off |
 | `--skip-dupes` | | Skip files that are content-identical to an already-processed file | off |
 | `--dry-run` | | Preview what would be processed without writing anything | off |
 | `--yes` | `-y` | Skip the confirmation prompt for `--replace` and `--rename-only` | off |
-| `--preset NAME` | | Start from a recipe: `web`, `archive`, `compact`, or `last` (the settings of your previous run). Flags you type explicitly still win. | off |
+| `--preset NAME` | | Start from a recipe: `web`, `archive`, `compact`, or `last` (the settings of your previous run). Flags you type explicitly still win; a preset's byte budget quietly steps aside for `--lossless`, `-f original` or `--rename-only`. | off |
 | `--quiet` | | Print only errors — no config table, progress bar or summary | off |
 | `--args-file` | | *Internal.* Reads one argument per line from a file, then deletes it. The macOS Quick Action uses this to hand over a Finder selection. | off |
 
