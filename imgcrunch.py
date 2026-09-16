@@ -1917,19 +1917,31 @@ def main():
     info(f"{C.DIM}{'─' * 60}{C.RESET}")
 
     # Find images
+    #
+    # Everything in this phase runs once per file, so per-file syscalls add up:
+    # on 10,000 files resolve() alone - an lstat for every path component -
+    # took over a second before the progress bar appeared. Anything that is
+    # the same for every file is computed once, and input roots are cached.
     all_images_with_sizes = find_images_from_paths(input_paths)
     images_with_sizes = []
     explicit_files = {p.resolve() for p in input_paths if p.is_file()}
+    output_arg_dir = Path(args.output).resolve() if args.output else None
+    roots: dict[Path, Path] = {}
+
+    def root_of(img: Path) -> Path:
+        if img not in roots:
+            roots[img] = get_input_root(img, input_paths)
+        return roots[img]
 
     for img, sz in all_images_with_sizes:
-        if img.resolve() in explicit_files:
+        if explicit_files and img.resolve() in explicit_files:
             images_with_sizes.append((img, sz))
             continue
 
-        root = get_input_root(img, input_paths)
+        root = root_of(img)
         exclude_dirs = []
         if args.output:
-            exclude_dirs.append(str(Path(args.output).resolve()))
+            exclude_dirs.append(str(output_arg_dir))
         elif merge_mode:
             exclude_dirs.append(str(output_dir))
         else:
@@ -1982,7 +1994,7 @@ def main():
     tasks: list[tuple[Path, Path, int]] = []
     seen_outputs = set()
     for idx, img_path in enumerate(images_to_process, start=1):
-        input_root = get_input_root(img_path, input_paths)
+        input_root = root_of(img_path)
         target_ext = img_path.suffix if args.format == 'original' else fmt['extension']
 
         if replace_mode:
@@ -1990,7 +2002,7 @@ def main():
             # afterwards. Avoids leaving an empty converted/ in the source.
             target_out_dir = output_dir
         elif args.output:
-            target_out_dir = Path(args.output).resolve()
+            target_out_dir = output_arg_dir
         elif merge_mode:
             target_out_dir = output_dir
         else:
@@ -1999,10 +2011,15 @@ def main():
         output_path = get_output_path(
             img_path, target_out_dir, input_root if not merge_mode else None, target_ext,
             rename_base=rename_base, rename_index=idx, total_count=len(images_to_process),
-            merge_mode=merge_mode, create_dirs=not dry_run
+            merge_mode=merge_mode, create_dirs=False
         )
-        
-        if output_path.resolve() == img_path.resolve():
+
+        # Never write an output onto its own source. A plain comparison covers
+        # the ordinary case; the samefile check catches the same file reached
+        # another way (a symlinked -o) and only costs a stat when the output
+        # already exists, which is the only way it could be the source.
+        if output_path == img_path or (output_path.exists()
+                                       and os.path.samefile(output_path, img_path)):
             continue
             
         if merge_mode and not rename_base:
@@ -2016,6 +2033,11 @@ def main():
         seen_outputs.add(output_path)
         file_size = image_sizes.get(str(img_path), 0)
         tasks.append((img_path, output_path, file_size))
+
+    # One mkdir per distinct folder instead of one per file.
+    if not dry_run:
+        for folder in {out.parent for _, out, _ in tasks}:
+            folder.mkdir(parents=True, exist_ok=True)
 
     # Dry run: report the plan and exit without writing, moving, or replacing.
     if dry_run:

@@ -1859,3 +1859,55 @@ class TestJpegDraftDecode:
         assert res.original_size == (3000, 4000)
         with Image.open(tmp_path / "o.jpg") as im:
             assert im.size == (750, 1000)
+
+
+# ── An output must never be written onto its own source ──────────────────────
+
+class TestOutputNeverOverwritesSource:
+    """Characterisation before the preparation phase loses its resolve() calls."""
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_output_dir_equal_to_input_skips_the_file(self, tmp_path):
+        src = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (5, 6, 7)).save(src)
+        before = src.read_bytes()
+
+        r = self._run(str(tmp_path), "-o", str(tmp_path), "-f", "jpeg", "-m", "400",
+                      "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert src.read_bytes() == before
+
+    def test_output_dir_reached_through_a_symlink_is_recognised(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        src = real / "a.jpg"
+        Image.new("RGB", (900, 700), (5, 6, 7)).save(src)
+        before = src.read_bytes()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        r = self._run(str(real), "-o", str(link), "-f", "jpeg", "-m", "400", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert src.read_bytes() == before
+
+
+class TestNestedOutputLayout:
+    def test_subfolders_are_mirrored_into_converted(self, tmp_path):
+        for sub in ("x", "y/z"):
+            (tmp_path / sub).mkdir(parents=True)
+            Image.new("RGB", (300, 200)).save(tmp_path / sub / "p.jpg")
+
+        r = subprocess.run([sys.executable, str(REPO_ROOT / "imgcrunch.py"), str(tmp_path),
+                            "-f", "webp", "--no-move"],
+                           input="", capture_output=True, text=True, timeout=120)
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "converted" / "x" / "p.webp").exists()
+        assert (tmp_path / "converted" / "y" / "z" / "p.webp").exists()
