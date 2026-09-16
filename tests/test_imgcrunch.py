@@ -924,7 +924,7 @@ class TestPostHook:
         r = self._run(str(tmp_path), "-f", "jpeg", "--no-move",
                       "--post-hook", "echo boom >&2; exit 3")
 
-        assert r.returncode == 0, r.stderr
+        assert r.returncode == 1, "a failing hook is a failed step (see TestExitCode)"
         combined = (r.stdout + r.stderr).lower()
         # "post-hook" and "3" both appear in the echoed config line, so assert
         # on wording that can only come from the failure report itself.
@@ -2176,3 +2176,70 @@ class TestFolderModes:
         assert r.returncode == 0, r.stdout + r.stderr
         assert (tmp_path / "a.jpg").exists()
         assert not (tmp_path / "originals").exists()
+
+
+# ── Exit code: a script has to be able to tell that something failed ─────────
+
+class TestExitCode:
+    """
+    The exit code was 0 even when images failed, so a script - especially one
+    using --quiet - had no way to notice short of parsing the output.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _good(self, path):
+        Image.new("RGB", (600, 400), (3, 4, 5)).save(path / "good.jpg")
+
+    def _bad(self, path):
+        (path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+    def test_clean_run_exits_zero(self, tmp_path):
+        self._good(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--no-move").returncode == 0
+
+    def test_a_failed_image_exits_one(self, tmp_path):
+        self._good(tmp_path)
+        self._bad(tmp_path)
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move")
+
+        assert r.returncode == 1
+        assert (tmp_path / "converted" / "good.webp").exists(), "the rest still runs"
+
+    def test_quiet_run_still_exits_one(self, tmp_path):
+        self._bad(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--no-move", "--quiet").returncode == 1
+
+    def test_failing_post_step_exits_one(self, tmp_path):
+        self._good(tmp_path)
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move", "--post-hook", "exit 4")
+
+        assert r.returncode == 1
+
+    def test_dry_run_attempts_nothing_so_exits_zero(self, tmp_path):
+        self._bad(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--dry-run").returncode == 0
+
+    def test_warnings_alone_exit_zero(self, tmp_path):
+        _make_image(tmp_path / "logo.png", size=(300, 200), color=(0, 90, 200, 0), mode="RGBA")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move")
+
+        assert "transparency" in r.stdout
+        assert r.returncode == 0
+
+    def test_main_returns_the_code_for_cli(self, tmp_path, monkeypatch):
+        self._bad(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp",
+                                          "--no-move", "--quiet"])
+
+        assert ic.main() == 1

@@ -1685,7 +1685,7 @@ def parse_cli(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main():
+def main() -> int:
     # Expand --args-file if present
     if '--args-file' in sys.argv:
         # The macOS Quick Action hands the Finder selection over this way, one
@@ -2281,10 +2281,14 @@ def main():
             # A convenience for next time; never fail a finished batch over it.
             pass
 
+    # 1 if anything failed - an image, or a replace, move or post-hook after it -
+    # so scripts can tell without parsing the output. Warnings do not count.
+    exit_code = 1 if (stats.errors or stats.post_errors) else 0
+
     if quiet:
-        # Nothing went wrong worth interrupting a script for, so say nothing.
-        # Individual failures were already printed as they happened.
-        return
+        # Individual failures were already printed as they happened; the exit
+        # code carries the rest.
+        return exit_code
 
     print_summary(stats, elapsed, output_dir)
     if replace_mode:
@@ -2297,23 +2301,29 @@ def main():
         else:
             print(f"\n  {C.BOLD}Outputs saved to respective '<folder>/converted/' directories.{C.RESET}\n")
 
+    return exit_code
+
 
 def cli() -> None:
     """
     Console-script entry point (see pyproject.toml).
+
+    Exit codes: 0 success, 1 something failed (or a destructive run was not
+    confirmed), 2 a usage error, 130 cancelled during the batch.
 
     An interrupt during the batch is handled inside main(), where the counters
     are. One that arrives earlier - in the wizard, while scanning - lands here,
     and at that point nothing has been touched yet.
     """
     try:
-        main()
+        code = main()
     except KeyboardInterrupt:
         print()
         print(f"  {C.DIM}Cancelled — nothing was changed.{C.RESET}")
         print(f"  {C.DIM}Run imgcrunch again whenever you're ready. 👋{C.RESET}")
         print()
         sys.exit(0)
+    sys.exit(code)
 
 
 if __name__ == '__main__':
