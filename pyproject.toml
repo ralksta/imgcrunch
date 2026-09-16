@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imgcrunch"
+dynamic = ["version"]
+description = "Fast parallel image converter and resizer with a guided wizard and a macOS Quick Action"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"              # presets.py reads its config with tomllib
+# Pillow is the only hard requirement, and it encodes JPEG, WebP and AVIF on
+# its own (AVIF since 11.3). Everything else is detected at runtime and the
+# encoder preflight names the missing package, so the rest are extras.
+dependencies = ["Pillow>=11.3"]
+
+[project.optional-dependencies]
+heic     = ["pillow-heif>=0.16"]
+jxl      = ["pillow-jxl-plugin>=0.1"]
+exif     = ["piexif>=1.1.3"]          # EXIF dimension tags follow a resize (JPEG)
+progress = ["tqdm>=4.60"]
+all      = ["imgcrunch[heic,jxl,exif,progress]"]
+dev      = ["imgcrunch[all]", "pytest>=8.0"]
+
+[project.scripts]
+imgcrunch = "imgcrunch:cli"
+
+[tool.setuptools]
+py-modules = ["imgcrunch", "sizing", "presets"]
+
+[tool.setuptools.dynamic]
+version = { attr = "imgcrunch.__version__" }
+
+[tool.pytest.ini_options]
+testpaths  = ["tests"]
+pythonpath = ["."]

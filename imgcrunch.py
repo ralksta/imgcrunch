@@ -6,6 +6,8 @@ Supports JPEG, HEIC, AVIF, and WebP output formats.
 Preserves EXIF metadata. Parallel processing with progress bar.
 """
 
+__version__ = "1.1.0.dev0"
+
 import argparse
 import hashlib
 import io
@@ -28,6 +30,7 @@ from typing import Optional
 # imgcrunch.needs_resize / imgcrunch.calculate_new_size. Also imported as a
 # module (below) so the target-size worker path can call sizing.search_quality
 # / sizing.search_scale / sizing.parse_size directly.
+import presets
 import sizing
 from sizing import calculate_new_size, needs_resize  # noqa: F401
 
@@ -80,6 +83,8 @@ C = Color
 # ── Configuration ────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_SIZE   = 3000
+# How far above the target size a JPEG is decoded before LANCZOS; see draft().
+JPEG_DRAFT_GAP     = 1.5
 OUTPUT_FOLDER_NAME = 'converted'
 MAX_WORKERS        = os.cpu_count() or 4
 
@@ -98,7 +103,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 EXT_TO_FORMAT = {
-    '.jpg': 'jpeg', '.jpeg': 'jpeg', '.png': 'jpeg', '.bmp': 'jpeg',
+    '.jpg': 'jpeg', '.jpeg': 'jpeg', '.png': 'webp', '.bmp': 'jpeg',
     '.tiff': 'jpeg', '.tif': 'jpeg', '.webp': 'webp', '.gif': 'webp',
     '.heic': 'heic', '.heif': 'heic',
     '.avif': 'avif', '.jxl': 'jxl',
@@ -167,12 +172,19 @@ class BatchStats:
     processed:          int   = 0
     resized:            int   = 0
     errors:             int   = 0
+    # Failures *after* a successful encode - a replace, a move or a post-hook
+    # that blew up. Kept apart from `errors` because the output does exist for
+    # these; it is the step afterwards that did not happen.
+    post_errors:        int   = 0
     moved:              int   = 0
     replaced:           int   = 0
     skipped:            int   = 0
     duplicates_skipped: int   = 0
     total_input_bytes:  int   = 0
     total_output_bytes: int   = 0
+    # (filename, reason) for every failure, so the summary can name them
+    # instead of only counting them.
+    failures: list = field(default_factory=list)
     # per source-format counters  {'.jpg': {'count': N, 'in': bytes, 'out': bytes}}
     by_format: dict = field(default_factory=lambda: defaultdict(lambda: {'count': 0, 'in': 0, 'out': 0}))
 
@@ -191,7 +203,7 @@ def format_bytes(size_bytes: int) -> str:
 # Install hints per format, used when the encoder probe fails.
 ENCODER_HINTS = {
     'heic': 'pip install pillow-heif',
-    'avif': 'pip install pillow-heif',
+    'avif': "pip install -U 'Pillow>=11.3'  (AVIF is built into Pillow)",
     'jxl':  'pip install pillow-jxl-plugin',
 }
 
@@ -344,19 +356,15 @@ def refresh_quicklook(paths: list[Path]) -> None:
     """Tell macOS Quick Look to regenerate thumbnails for the given files."""
     if not IS_MACOS or not paths:
         return
-    try:
-        subprocess.run(
-            ['qlmanage', '-r', 'cache'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-        # Touch each output file so Finder notices the change
-        for p in paths:
+    # Touching each output is enough for Finder to notice it. The old code also
+    # ran `qlmanage -r cache`, which throws away the Quick Look thumbnails for
+    # every file on the machine - a system-wide cost for a per-file problem.
+    for p in paths:
+        try:
             if p.exists():
                 p.touch()
-    except Exception:
-        pass
+        except OSError:
+            pass
 
 
 def set_terminal_title(title: str) -> None:
@@ -494,13 +502,44 @@ def process_image(
         with Image.open(input_path) as img:
             is_animated_gif = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
 
+            # True dimensions of the file, as displayed. Everything below sizes
+            # its decisions on these - never on img.size, which draft() shrinks.
+            width, height = img.size
+            orientation = (img.getexif().get(0x0112, 1)
+                           if strip_exif and not is_animated_gif else 1)
+            # exif_transpose returns a full copy of the image even when the
+            # orientation is already upright, so only call it when it turns.
+            will_transpose = orientation in (2, 3, 4, 5, 6, 7, 8)
+            quarter_turn = orientation in (5, 6, 7, 8)
+            if quarter_turn:
+                width, height = height, width
+            result.original_size = (width, height)
+
+            # A JPEG that is about to be shrunk does not need decoding at full
+            # size: libjpeg can scale by 1/2, 1/4 or 1/8 in the DCT domain.
+            # draft() picks the strongest of those that keeps *both* edges at or
+            # above the box, so the box is built from the real target size - a
+            # square max_size box lets the short edge veto a scale the target
+            # allows.
+            #
+            # The box is JPEG_DRAFT_GAP times the target, not the target itself.
+            # When the DCT scale lands exactly on the target, it *is* the whole
+            # resample, and on fine texture that measured ~31 dB against a full
+            # decode; with 1.5x headroom LANCZOS does the last step and stays
+            # above 44 dB. The price is no speed-up for mild (< 1.5x) shrinks.
+            #
+            # It must run before anything loads the pixels - exif_transpose
+            # and convert() both do - or it silently does nothing. The file is
+            # still in stored orientation here, so a quarter turn swaps the box.
+            if img.format == 'JPEG' and needs_resize(width, height, max_size):
+                tw, th = calculate_new_size(width, height, max_size)
+                box = (int(tw * JPEG_DRAFT_GAP), int(th * JPEG_DRAFT_GAP))
+                img.draft(img.mode, box[::-1] if quarter_turn else box)
+
             # When stripping metadata, bake the EXIF orientation into the pixels
             # first — otherwise the output would silently appear rotated.
-            if strip_exif and not is_animated_gif:
+            if will_transpose:
                 img = ImageOps.exif_transpose(img)
-
-            width, height = img.size
-            result.original_size = (width, height)
 
             # Early bail-out: already target format, no resize, no mode conversion
             # needed, and no strip. Copy straight through to the output location so
@@ -551,8 +590,13 @@ def process_image(
                     elif use_piexif and input_ext in ('.jpg', '.jpeg', '.tiff', '.tif'):
                         exif_dict  = piexif.load(str(input_path))
                         exif_bytes = piexif.dump(exif_dict)
-                except Exception:
-                    exif_dict = None
+                except Exception as exc:
+                    # Losing the metadata silently means the user finds out
+                    # months later that the timestamps are gone.
+                    exif_dict  = None
+                    exif_bytes = None
+                    result.warning = (f"EXIF metadata could not be read "
+                                      f"({exc}); saved without it")
 
             # Handle Animation (GIF/etc -> WebP/AVIF)
             is_animated = is_animated_gif and format_key in ('webp', 'avif')
@@ -618,6 +662,14 @@ def process_image(
                         background = Image.new('RGB', img.size, (255, 255, 255))
                         if img.mode == 'P':
                             img = img.convert('RGBA')
+                        # Only real transparency is lost here - an alpha channel
+                        # that is opaque everywhere flattens to the same pixels.
+                        if img.getchannel('A').getextrema()[0] < 255:
+                            note = (f"transparency flattened onto white \u2014 "
+                                    f"{format_key.upper()} has no alpha channel; "
+                                    f"webp, avif or jxl would keep it")
+                            result.warning = (f"{result.warning}; {note}"
+                                              if result.warning else note)
                         background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
                         img = background
                 elif img.mode != 'RGB' and not (supports_alpha and img.mode == 'RGBA'):
@@ -727,16 +779,34 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
 
     # Set by the copy-only / rename-only branches below; None means the
     # corresponding question still has to be asked.
+    format_key: Optional[str] = None
     max_px       = None
     target_bytes = None
+    quality_pick: Optional[int]  = None
+    strip_mode:   Optional[bool] = None
+    lossless     = False
+    preset_used  = False
 
     # 1. Resolve inputs
     input_paths = []
     if prefills:
+        missing = []
         for p in prefills:
             resolved = Path(p).expanduser().resolve()
             if resolved.exists():
                 input_paths.append(resolved)
+            else:
+                missing.append(resolved)
+        # A Finder selection whose files moved or vanished used to shrink
+        # without a word ("Found 4 input item(s)" for five selected).
+        if missing:
+            print(f"  {C.YELLOW}\u26a0\ufe0f  {len(missing)} of {len(prefills)} selected "
+                  f"item(s) no longer exist and were skipped:{C.RESET}")
+            for m in missing[:5]:
+                print(f"    {C.DIM}{m}{C.RESET}")
+            if len(missing) > 5:
+                print(f"    {C.DIM}\u2026 and {len(missing) - 5} more{C.RESET}")
+            print()
 
     if not input_paths:
         print(f"  {C.BOLD}Enter the path to the folder containing your images:{C.RESET}")
@@ -844,8 +914,47 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Keep originals{C.RESET}")
         print()
 
-    # 3. Format (if not copy-only)
-    if 'format_key' not in locals():
+    # 3. Preset - answers format, quality, size, budget and metadata at once.
+    # Only offered when there is something to encode; a preset never sets the
+    # mode, so it cannot be the step that turns on replace.
+    if format_key is None:
+        choices = []
+        last = presets.load_last_run()
+        if last:
+            choices.append(('Last run', last))
+        for builtin in presets.BUILTIN_PRESETS.values():
+            choices.append((builtin['label'], builtin))
+        custom_key = str(len(choices) + 1)
+        default_key = '1' if last else custom_key
+
+        print(f"  {C.BOLD}How should the images be encoded?{C.RESET}")
+        print()
+        for i, (label, settings) in enumerate(choices, start=1):
+            print(f"    [{C.CYAN}{i}{C.RESET}]  {label:<12} {C.DIM}\u2014 "
+                  f"{presets.describe(settings)}{C.RESET}")
+        print(f"    [{C.CYAN}{custom_key}{C.RESET}]  Choose each setting \u2026")
+        print()
+        while True:
+            pick = input(f"  Preset (1-{custom_key}) [{C.CYAN}{default_key}{C.RESET}]: "
+                         ).strip() or default_key
+            if pick.isdigit() and 1 <= int(pick) <= int(custom_key):
+                break
+            print(f"  {C.YELLOW}\u26a0\ufe0f  Please enter a number from 1 to {custom_key}.{C.RESET}")
+
+        if pick != custom_key:
+            label, chosen = choices[int(pick) - 1]
+            format_key   = chosen['format']
+            quality_pick = chosen['quality']
+            max_px       = chosen['max_size']
+            target_bytes = chosen['target_size']
+            strip_mode   = chosen['strip']
+            lossless     = chosen['lossless']
+            preset_used  = True
+            print(f"  {C.GREEN}\u2705  {label}: {presets.describe(chosen)}{C.RESET}")
+            print()
+
+    # 4. Format (if not copy-only and no preset)
+    if format_key is None:
         format_keys    = ['jpeg', 'heic', 'avif', 'webp', 'jxl']
         detected_index = str(format_keys.index(detected_format) + 1) if detected_format in format_keys else None
         default_index  = detected_index or '1'
@@ -871,11 +980,12 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         format_key = format_options[choice][0]
 
     if format_key != 'original' and not rename_only:
-        default_quality = FORMAT_QUALITY_DEFAULTS[format_key]
+        default_quality = quality_pick or FORMAT_QUALITY_DEFAULTS[format_key]
         # Whether the format is actually encodable (not just importable) is
         # decided by probe_encoder() in main() before the batch starts — no
         # need to duplicate a weaker import-only check here.
-        print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
+        if not preset_used:
+            print(f"  {C.GREEN}✅  Format: {format_key.upper()}{C.RESET}")
     else:
         default_quality = None
         if rename_only:
@@ -884,16 +994,43 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
     print()
 
-    # 4. Max longest side (if not copy-only)
+    # Lossless and quality - only on the guided path, where no preset decided
+    # them. Lossless comes first because it makes the quality moot.
+    guided = format_key != 'original' and not rename_only and not preset_used
+    if guided and format_key in ('webp', 'avif'):
+        answer = input(f"  Lossless? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+        lossless = answer in ('y', 'yes')
+        if lossless:
+            print(f"  {C.GREEN}\u2705  Lossless {format_key.upper()} \u2014 larger files, "
+                  f"no quality loss{C.RESET}")
+        print()
+    if guided and not lossless:
+        print(f"  {C.BOLD}Which quality?{C.RESET}")
+        print(f"  {C.DIM}Lower means smaller files. Enter keeps the tuned default "
+              f"for {format_key.upper()}.{C.RESET}")
+        print()
+        while True:
+            raw = input(f"  Quality (1-100) [{C.CYAN}{default_quality}{C.RESET}]: ").strip()
+            if not raw:
+                break
+            if raw.isdigit() and 1 <= int(raw) <= 100:
+                default_quality = int(raw)
+                break
+            print(f"  {C.YELLOW}\u26a0\ufe0f  Please enter a whole number from 1 to 100.{C.RESET}")
+        print(f"  {C.GREEN}\u2705  Quality: {default_quality}{C.RESET}")
+        print()
+
+    # 5. Max longest side (if not copy-only)
     if max_px is None:
         print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
         print(f"  {C.DIM}Images larger than this will be resized down.{C.RESET}")
-        print(f"  {C.DIM}(press Enter for default: no resizing, convert only){C.RESET}")
+        print(f"  {C.DIM}(press Enter for {DEFAULT_MAX_SIZE}px, the same default as the "
+              f"command line; 0 = no resizing){C.RESET}")
         print()
         while True:
-            size_input = input(f"  Max longest side [{C.CYAN}no resize{C.RESET}]: ").strip()
+            size_input = input(f"  Max longest side [{C.CYAN}{DEFAULT_MAX_SIZE}{C.RESET}]: ").strip()
             if not size_input:
-                max_px = 0
+                max_px = DEFAULT_MAX_SIZE
                 break
             try:
                 max_px = int(size_input)
@@ -912,11 +1049,11 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Max size: {max_px}px{C.RESET}")
         print()
 
-    # 5. Max file size (only when we actually re-encode)
+    # 6. Max file size (only when we actually re-encode)
     # A byte budget needs something to trade away, so it is only offered when
     # a real output format was chosen. That also makes the CLI's --target-size
     # conflicts (--format original, --lossless) unreachable from here.
-    if format_key != 'original' and not rename_only:
+    if format_key != 'original' and not rename_only and not preset_used and not lossless:
         print(f"  {C.BOLD}What should the max file size per image be?{C.RESET}")
         print(f"  {C.DIM}Quality is lowered first, then dimensions if needed.{C.RESET}")
         print(f"  {C.DIM}e.g. 500k, 1.5m  (press Enter for no limit){C.RESET}")
@@ -942,7 +1079,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Max file size: {format_bytes(parsed)}{C.RESET}")
         print()
 
-    # 6. Rename (keep mode, merge mode, or the whole point in rename-only mode)
+    # 7. Rename (keep mode, merge mode, or the whole point in rename-only mode)
     rename_base = None
     if rename_only:
         print(f"  {C.BOLD}What should the new base name be?{C.RESET}")
@@ -982,9 +1119,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             rename_base = None
         print()
 
-    # 7. Privacy Mode (EXIF stripping) — not applicable when only renaming
-    strip_mode = False
-    if not rename_only:
+    # 8. Privacy Mode (EXIF stripping) — not applicable when only renaming
+    if rename_only:
+        strip_mode = False
+    elif strip_mode is None:
         print(f"  {C.BOLD}Would you like to strip all EXIF metadata (Privacy Mode)?{C.RESET}")
         print(f"  {C.DIM}This removes GPS coordinates, camera model, etc.{C.RESET}")
         print()
@@ -994,6 +1132,18 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Privacy Mode: EXIF metadata will be stripped{C.RESET}")
         else:
             print(f"  {C.GREEN}✅  EXIF metadata will be preserved{C.RESET}")
+        print()
+
+    # 9. Duplicates - guided path only; presets stay a one-key choice.
+    skip_dupes = False
+    if guided:
+        print(f"  {C.BOLD}Skip files that are exact duplicates of another image?{C.RESET}")
+        print(f"  {C.DIM}Compares file contents, not names. Costs a hashing pass first.{C.RESET}")
+        print()
+        answer = input(f"  Skip duplicates? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+        skip_dupes = answer in ('y', 'yes')
+        if skip_dupes:
+            print(f"  {C.GREEN}\u2705  Duplicates will be skipped{C.RESET}")
         print()
 
     # Confirmation
@@ -1009,8 +1159,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print()
         print(f"  {C.YELLOW}⚠️  The original filenames cannot be restored afterwards.{C.RESET}")
         print()
-        confirm = input(f"  Start renaming? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
-        if confirm and confirm not in ('y', 'yes'):
+        confirm = input(f"  Start renaming? ({C.GREEN}Y{C.RESET}/n"
+                        f"{C.DIM} \u00b7 d = dry run{C.RESET}): ").strip().lower()
+        dry_run = confirm in ('d', 'dry', 'dry run')
+        if confirm and not dry_run and confirm not in ('y', 'yes'):
             print()
             print(f"  {C.DIM}No worries — nothing was changed. 👋{C.RESET}")
             print()
@@ -1031,6 +1183,9 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             'post_hook':     None,
             'merge':         False,
             'strip':         False,
+            'dry_run':       dry_run,
+            'yes':           True,
+            'quiet':         False,
         }
 
     if merge_mode:
@@ -1039,7 +1194,16 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.BOLD}Mode:{C.RESET}         {'⚠️  Replace in-place' if replace_mode else '📂  Keep originals'}")
     print(f"  {C.BOLD}Format:{C.RESET}       {format_key.upper()}")
     if default_quality:
-        print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}(smart default for {format_key.upper()}){C.RESET}")
+        if lossless:
+            print(f"  {C.BOLD}Quality:{C.RESET}      lossless")
+        else:
+            if preset_used:
+                origin = "from preset"
+            elif default_quality == FORMAT_QUALITY_DEFAULTS[format_key]:
+                origin = f"smart default for {format_key.upper()}"
+            else:
+                origin = "chosen"
+            print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}({origin}){C.RESET}")
     print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if max_px == 0 else f'{max_px}px'}")
     if target_bytes:
         print(f"  {C.BOLD}Max file size:{C.RESET} {format_bytes(sizing.parse_size(target_bytes))}")
@@ -1050,6 +1214,8 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     if not replace_mode:
         print(f"  {C.BOLD}Rename:{C.RESET}       {rename_base + '_###' if rename_base else C.DIM + 'keep originals' + C.RESET}")
     print(f"  {C.BOLD}Privacy:{C.RESET}      {'⚠️  Strip metadata' if strip_mode else 'Keep EXIF metadata'}")
+    if skip_dupes:
+        print(f"  {C.BOLD}Duplicates:{C.RESET}   skipped")
     print(f"  {C.BOLD}Images:{C.RESET}       {len(scanned_images)}")
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
 
@@ -1058,8 +1224,22 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print(f"  {C.RED}{C.BOLD}⚠️  WARNING: This will permanently replace your original files!{C.RESET}")
 
     print()
-    confirm = input(f"  Start processing? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
-    if confirm and confirm not in ('y', 'yes'):
+    # Replace has no undo, so Enter must not be the button that triggers it.
+    # Every other mode keeps its friendly default.
+    # A dry run writes nothing, so it is safe to offer as a one-letter answer
+    # on every path - including replace, where it is the most useful.
+    hint = f"{C.DIM} \u00b7 d = dry run{C.RESET}"
+    if replace_mode:
+        prompt = f"  Start processing? (y/{C.GREEN}N{C.RESET}{hint}): "
+    else:
+        prompt = f"  Start processing? ({C.GREEN}Y{C.RESET}/n{hint}): "
+    confirm = input(prompt).strip().lower()
+    dry_run = confirm in ('d', 'dry', 'dry run')
+    if replace_mode:
+        started = dry_run or confirm in ('y', 'yes')
+    else:
+        started = dry_run or not confirm or confirm in ('y', 'yes')
+    if not started:
         print()
         print(f"  {C.DIM}No worries — nothing was changed.{C.RESET}")
         print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
@@ -1077,11 +1257,14 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'rename_only':   False,
         'replace':       replace_mode,
         'target_size':   target_bytes,
-        'lossless':      False,
-        'skip_dupes':    False,
+        'lossless':      lossless,
+        'skip_dupes':    skip_dupes,
         'post_hook':     None,
         'merge':         merge_mode,
         'strip':         strip_mode,
+        'dry_run':       dry_run,
+        'yes':           True,
+        'quiet':         False,
     }
 
 
@@ -1097,6 +1280,9 @@ def print_summary(stats: BatchStats, elapsed: float, output_dir: Path):
     print(f"  {C.BOLD}Images resized:{C.RESET}    {C.CYAN}{stats.resized}{C.RESET}")
     if stats.errors > 0:
         print(f"  {C.BOLD}Errors:{C.RESET}            {C.RED}{stats.errors}{C.RESET}")
+    if stats.post_errors > 0:
+        print(f"  {C.BOLD}Failed after encode:{C.RESET} {C.RED}{stats.post_errors}{C.RESET}"
+              f"  {C.DIM}(replace / move / post-hook){C.RESET}")
     if stats.skipped > 0:
         print(f"  {C.BOLD}Skipped (no-op):{C.RESET}   {C.DIM}{stats.skipped}{C.RESET}")
     if stats.duplicates_skipped > 0:
@@ -1145,6 +1331,136 @@ def print_summary(stats: BatchStats, elapsed: float, output_dir: Path):
 
     if stats.errors > 0:
         print(f"\n  {C.YELLOW}⚠️  {stats.errors} file(s) had errors and remain in the input folder{C.RESET}")
+    if stats.post_errors > 0:
+        print(f"  {C.YELLOW}⚠️  {stats.post_errors} file(s) were converted but could not be "
+              f"moved or replaced afterwards{C.RESET}")
+
+    if stats.failures:
+        print()
+        print(f"  {C.BOLD}What failed:{C.RESET}")
+        for name, reason in stats.failures[:10]:
+            print(f"    {C.RED}✗{C.RESET} {name}  {C.DIM}{reason}{C.RESET}")
+        if len(stats.failures) > 10:
+            print(f"    {C.DIM}… and {len(stats.failures) - 10} more{C.RESET}")
+
+
+# Worker failures arrive as raw exception text from Pillow and its plugins.
+# Some of it is fine to show; some of it ("cannot identify image file") tells
+# the reader nothing about what to do next.
+_ERROR_TRANSLATIONS = (
+    ('cannot identify image file',
+     'not readable as an image \u2014 damaged, or the extension lies about the format'),
+    ('truncated', 'the file is truncated \u2014 it was probably copied while still being written'),
+    ('encoder error', 'the encoder refused this image \u2014 the dimensions may be extreme'),
+    ('broken data stream', 'the image data is corrupt'),
+)
+
+
+def humanize_error(message: str) -> str:
+    """Turn an encoder's exception text into something actionable, or leave it."""
+    low = message.lower()
+    for needle, replacement in _ERROR_TRANSLATIONS:
+        if needle in low:
+            return replacement
+    return message
+
+
+def confirm_destructive(what: str, assume_yes: bool) -> bool:
+    """
+    Get consent before an irreversible run, or refuse to guess.
+
+    --replace and --rename-only cannot be undone. On a terminal we ask. In a
+    script there is nobody to ask, so the run stops instead of shredding files
+    on the strength of a flag that may have been pasted by accident; --yes is
+    how a script says it meant it.
+    """
+    if assume_yes:
+        return True
+
+    if not sys.stdin.isatty():
+        print(f"{C.RED}Error: {what} cannot be undone, and there is no terminal "
+              f"to confirm on.{C.RESET}")
+        print(f"{C.DIM}Re-run with --yes if that is really what you want.{C.RESET}")
+        return False
+
+    print()
+    print(f"  {C.YELLOW}\u26a0\ufe0f  {what} \u2014 this cannot be undone.{C.RESET}")
+    answer = input(f"  Continue? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+    return answer in ('y', 'yes')
+
+
+def cancellation_notice(stats: BatchStats, total: int) -> str:
+    """
+    Describe what a cancelled run left behind.
+
+    The old handler said "nothing was changed" no matter how far the batch had
+    got, which is false the moment a single original has been replaced or moved
+    away. Anything already done has to be named, because that is exactly what
+    someone hitting Ctrl+C needs to know.
+    """
+    done = stats.processed
+    if done == 0 and stats.replaced == 0 and stats.moved == 0:
+        return "Cancelled \u2014 nothing was changed."
+
+    parts = [f"Cancelled after {done} of {total} images."]
+    if stats.replaced:
+        parts.append(f"{stats.replaced} original(s) were already replaced.")
+    if stats.moved:
+        parts.append(f"{stats.moved} original(s) were already moved to originals/.")
+    if not stats.replaced and not stats.moved:
+        parts.append("Outputs written so far were kept; the originals are untouched.")
+    # Cancelling stops handing out work; it does not stop the workers already
+    # running. They finish the image they are on, so the output folder can hold
+    # more files than the count above - saying otherwise would be the same kind
+    # of lie this function exists to fix.
+    parts.append("Workers already running finished their current image, so a few "
+                 "more outputs may exist.")
+    return " ".join(parts)
+
+
+def make_staging_dir(input_paths: list[Path]) -> Path:
+    """
+    Create the temp dir that --replace stages its outputs in.
+
+    It goes next to the input on purpose. The default mkdtemp() lands under
+    /var/folders on the system volume, so replacing images on an external disk
+    turns every move into a full copy across the volume boundary — serial, in
+    the main thread, and long enough to matter. Next to the input it is a
+    rename instead.
+
+    Falls back to the system temp dir when the input's parent is not writable,
+    because a slow replace still beats no replace at all.
+    """
+    try:
+        return Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_',
+                                     dir=input_paths[0].parent))
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_'))
+
+
+def replace_original(input_path: Path, staged_path: Path, final_ext: str) -> Path:
+    """
+    Move a staged output over its original and return the final path.
+
+    The original is removed only *after* the replacement is safely in place.
+    Doing it the other way round — unlink first, then move — destroys the image
+    whenever the move fails, and it fails for ordinary reasons: a full disk, a
+    read-only parent, a vanished volume. On a format change the final path is a
+    *different* file from the original, so there is nothing to fall back on.
+
+    os.replace is atomic while both sides share a volume, which they do because
+    main() stages next to the input. The shutil.move fallback covers the case
+    where they don't; it is not atomic, but it still never removes the original
+    before the replacement exists.
+    """
+    final_path = input_path.with_suffix(final_ext)
+    try:
+        os.replace(staged_path, final_path)
+    except OSError:
+        shutil.move(str(staged_path), str(final_path))
+    if final_path != input_path:
+        input_path.unlink(missing_ok=True)
+    return final_path
 
 
 def move_to_originals(input_path: Path, originals_dir: Path, input_root: Path) -> Path:
@@ -1224,25 +1540,176 @@ def rename_in_place(images: list[Path], rename_base: str, dry_run: bool = False)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """
+    The CLI's argument definitions, in one place a test can reach.
+
+    The wizard hands main() a dict that becomes an argparse.Namespace, so
+    every wizard key has to be an argparse dest here. Building the parser
+    inside main() made that agreement untestable; the drift it allowed was
+    invisible because main() reads settings back with getattr defaults.
+    """
+    parser = argparse.ArgumentParser(
+        prog='imgcrunch',
+        description='ImgCrunch — Fast parallel image cruncher with format conversion.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Output modes:
+  By default, converted files go to <input>/converted/ and originals are
+  moved to <input>/originals/. Use --replace to overwrite originals in-place
+  (destructive). Use --no-move to leave originals where they are.
+
+Quality defaults (tuned per format):
+  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82   JXL: 85
+
+Examples:
+  imgcrunch /path/to/images                          # JPEG, smart quality, no resize
+  imgcrunch /path/to/images -f heic                  # HEIC with smart quality default
+  imgcrunch /path/to/images -f avif --max-size 2000  # AVIF, cap at 2000px
+  imgcrunch /path/to/images --lossless -f avif       # lossless AVIF
+  imgcrunch /path/to/images --target-size 500k        # every output under 500 KB
+  imgcrunch /path/to/images --skip-dupes             # skip content-identical files
+  imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
+  imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
+  imgcrunch /path/to/images --rename-only --rename vacation
+                                                # rename in-place only, no recompression
+  imgcrunch /path/to/images --strip                  # remove EXIF metadata
+  imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
+  imgcrunch /path/to/images --dry-run                # preview plan, write nothing
+  imgcrunch --wizard /path/to/images                 # interactive wizard
+        """
+    )
+    parser.add_argument('input_folders', nargs='+',
+                        help='Path to the folder(s) or file(s) containing images to process')
+    parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'jxl', 'original'], default='jpeg',
+                        help='Output format (default: jpeg, or original to keep format)')
+    parser.add_argument('-q', '--quality', type=int, default=None,
+                        help='Compression quality 1–100 (default: smart per-format default)')
+    parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
+                        help=f'Max longest side in px; 0 = convert only (default: {DEFAULT_MAX_SIZE})')
+    parser.add_argument('-o', '--output',
+                        help=f'Custom output folder (default: first <input>/{OUTPUT_FOLDER_NAME})')
+    parser.add_argument('--replace', action='store_true',
+                        help='Replace originals in-place (⚠️  destructive, no backup)')
+    parser.add_argument('--no-move', action='store_true',
+                        help="Keep originals in place (don't move to originals/)")
+    parser.add_argument('--rename', type=str, default=None, metavar='NAME',
+                        help='Rename output files as NAME_001, NAME_002, ...')
+    parser.add_argument('--rename-only', action='store_true', dest='rename_only',
+                        help='Only rename files in-place (no conversion, no resize, '
+                             'no copies). Requires --rename NAME.')
+    parser.add_argument('--lossless', action='store_true',
+                        help='Lossless encode (AVIF and WebP only)')
+    parser.add_argument('--target-size', type=str, default=None, dest='target_size',
+                        metavar='SIZE',
+                        help='Shrink every output below SIZE (e.g. 500k, 1.5m). '
+                             'Lowers quality first, then dimensions if needed.')
+    parser.add_argument('--skip-dupes', action='store_true',
+                        help='Skip files that are content-identical to an already-processed file')
+    parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
+                        help='Strip EXIF metadata from output images (Privacy Mode)')
+    # SUPPRESS keeps --strip's False as the default; this flag exists so an
+    # explicit choice can undo a preset that strips.
+    parser.add_argument('--no-strip', action='store_false', dest='strip',
+                        default=argparse.SUPPRESS,
+                        help='Keep EXIF metadata even if --preset would strip it')
+    parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
+                        help='Shell command to run after each file. '
+                             'Use {in} and {out} as placeholders.')
+    parser.add_argument('--merge', action='store_true',
+                        help='Merge all input folders/files into a single output folder')
+    parser.add_argument('--dry-run', action='store_true', dest='dry_run',
+                        help='Show what would be processed without writing anything')
+    parser.add_argument('--preset', metavar='NAME', default=None,
+                        choices=['last', *presets.BUILTIN_PRESETS],
+                        help='Start from a saved recipe: '
+                             + ', '.join(['last', *presets.BUILTIN_PRESETS])
+                             + '. Flags given explicitly still win.')
+    parser.add_argument('--workers', type=_positive_int, default=None, metavar='N',
+                        help=f'Parallel encoder processes (default: one per core, '
+                             f'{MAX_WORKERS} here). Lower it to keep the machine usable.')
+    parser.add_argument('--version', action='version',
+                        version=f'imgcrunch {__version__}')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Print only errors — no config table, progress '
+                             'bar or summary')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Skip the confirmation prompt for --replace '
+                             'and --rename-only')
+    return parser
+
+
+def parse_cli(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """
+    Parse the command line, applying --preset underneath explicit flags.
+
+    argparse cannot tell a default from a value the user typed, so the preset
+    is installed as the parser's *defaults* and the line is parsed again:
+    anything given explicitly then overrides it, exactly as with the built-in
+    defaults.
+    """
+    parser = build_parser()
+    first, _ = parser.parse_known_args(argv)
+    if first.preset:
+        if first.preset == 'last':
+            chosen = presets.load_last_run()
+            if chosen is None:
+                parser.error("--preset last: no previous run is remembered yet "
+                             "\u2014 finish one conversion first")
+        else:
+            chosen = presets.BUILTIN_PRESETS[first.preset]
+        parser.set_defaults(
+            format=chosen['format'], quality=chosen['quality'],
+            max_size=chosen['max_size'], target_size=chosen['target_size'],
+            strip=chosen['strip'], lossless=chosen['lossless'],
+        )
+    args = parser.parse_args(argv)
+
+    # A byte budget that came from the preset must yield to a flag the user
+    # did type and that rules budgets out. Otherwise `--preset web --lossless`
+    # fails with an error about --target-size, which nobody typed. A budget
+    # given explicitly is left alone and still conflicts, as it should.
+    if first.preset and first.target_size is None and args.target_size is not None:
+        if args.lossless or args.format == 'original' or args.rename_only:
+            args.target_size = None
+    return args
+
+
+def main() -> int:
     # Expand --args-file if present
     if '--args-file' in sys.argv:
+        # The macOS Quick Action hands the Finder selection over this way, one
+        # argument per line. A failure here used to print a note and carry on
+        # with --args-file still in argv, which then tripped the stray-flag
+        # check below and blamed --wizard for it. Say what actually broke.
+        idx = sys.argv.index('--args-file')
+        if idx + 1 >= len(sys.argv):
+            print(f"{C.RED}Error: --args-file needs a path.{C.RESET}")
+            sys.exit(2)
+        args_file_path = sys.argv[idx + 1]
         try:
-            idx = sys.argv.index('--args-file')
-            args_file_path = sys.argv[idx + 1]
-            expanded_args = []
             with open(args_file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.rstrip('\r\n')
-                    if line:
-                        expanded_args.append(line)
-            try:
-                os.unlink(args_file_path)
-            except OSError:
-                pass
-            sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
-        except Exception as e:
-            print(f"Error expanding args file: {e}")
+                expanded_args = [line.rstrip('\r\n') for line in f
+                                 if line.rstrip('\r\n')]
+        except OSError as e:
+            print(f"{C.RED}Error: cannot read --args-file "
+                  f"{args_file_path}: {e}{C.RESET}")
+            sys.exit(2)
+        try:
+            os.unlink(args_file_path)
+        except OSError:
+            pass
+        sys.argv = sys.argv[:idx] + expanded_args + sys.argv[idx + 2:]
 
     if '--wizard' in sys.argv:
         # Everything else on the line becomes a path prefill for the wizard, and
@@ -1266,73 +1733,7 @@ def main():
             sys.exit(0)
         args = argparse.Namespace(**wizard_result)
     else:
-        parser = argparse.ArgumentParser(
-            prog='imgcrunch',
-            description='ImgCrunch — Fast parallel image cruncher with format conversion.',
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""\
-Output modes:
-  By default, converted files go to <input>/converted/ and originals are
-  moved to <input>/originals/. Use --replace to overwrite originals in-place
-  (destructive). Use --no-move to leave originals where they are.
-
-Quality defaults (tuned per format):
-  JPEG: 85   HEIC: 65   AVIF: 60   WebP: 82   JXL: 85
-
-Examples:
-  imgcrunch /path/to/images                          # JPEG, smart quality, no resize
-  imgcrunch /path/to/images -f heic                  # HEIC with smart quality default
-  imgcrunch /path/to/images -f avif --max-size 2000  # AVIF, cap at 2000px
-  imgcrunch /path/to/images --lossless -f avif       # lossless AVIF
-  imgcrunch /path/to/images --target-size 500k        # every output under 500 KB
-  imgcrunch /path/to/images --skip-dupes             # skip content-identical files
-  imgcrunch /path/to/images --replace -f jpeg        # replace originals in-place
-  imgcrunch /path/to/images --rename vacation        # rename: vacation_001.jpg, ...
-  imgcrunch /path/to/images --rename-only --rename vacation
-                                                    # rename in-place only, no recompression
-  imgcrunch /path/to/images --strip                  # remove EXIF metadata
-  imgcrunch /path/to/images --post-hook 'echo {out}' # run command after each file
-  imgcrunch /path/to/images --dry-run                # preview plan, write nothing
-  imgcrunch --wizard /path/to/images                 # interactive wizard
-            """
-        )
-        parser.add_argument('input_folders', nargs='+',
-                            help='Path to the folder(s) or file(s) containing images to process')
-        parser.add_argument('-f', '--format', choices=['jpeg', 'heic', 'avif', 'webp', 'jxl', 'original'], default='jpeg',
-                            help='Output format (default: jpeg, or original to keep format)')
-        parser.add_argument('-q', '--quality', type=int, default=None,
-                            help='Compression quality 1–100 (default: smart per-format default)')
-        parser.add_argument('-m', '--max-size', type=int, default=DEFAULT_MAX_SIZE,
-                            help=f'Max longest side in px; 0 = convert only (default: {DEFAULT_MAX_SIZE})')
-        parser.add_argument('-o', '--output',
-                            help=f'Custom output folder (default: first <input>/{OUTPUT_FOLDER_NAME})')
-        parser.add_argument('--replace', action='store_true',
-                            help='Replace originals in-place (⚠️  destructive, no backup)')
-        parser.add_argument('--no-move', action='store_true',
-                            help="Keep originals in place (don't move to originals/)")
-        parser.add_argument('--rename', type=str, default=None, metavar='NAME',
-                            help='Rename output files as NAME_001, NAME_002, ...')
-        parser.add_argument('--rename-only', action='store_true', dest='rename_only',
-                            help='Only rename files in-place (no conversion, no resize, '
-                                 'no copies). Requires --rename NAME.')
-        parser.add_argument('--lossless', action='store_true',
-                            help='Lossless encode (AVIF and WebP only)')
-        parser.add_argument('--target-size', type=str, default=None, dest='target_size',
-                            metavar='SIZE',
-                            help='Shrink every output below SIZE (e.g. 500k, 1.5m). '
-                                 'Lowers quality first, then dimensions if needed.')
-        parser.add_argument('--skip-dupes', action='store_true',
-                            help='Skip files that are content-identical to an already-processed file')
-        parser.add_argument('--strip', '--no-exif', action='store_true', dest='strip',
-                            help='Strip EXIF metadata from output images (Privacy Mode)')
-        parser.add_argument('--post-hook', type=str, default=None, metavar='CMD',
-                            help='Shell command to run after each file. '
-                                 'Use {in} and {out} as placeholders.')
-        parser.add_argument('--merge', action='store_true',
-                            help='Merge all input folders/files into a single output folder')
-        parser.add_argument('--dry-run', action='store_true', dest='dry_run',
-                            help='Show what would be processed without writing anything')
-        args = parser.parse_args()
+        args = parse_cli()
 
     # Resolve quality
     quality = getattr(args, 'quality', None)
@@ -1397,8 +1798,29 @@ Examples:
                   f"apply.{C.RESET}")
             sys.exit(1)
 
+    assume_yes = getattr(args, 'yes', False)
+    workers    = getattr(args, 'workers', None) or MAX_WORKERS
+    quiet      = getattr(args, 'quiet', False)
+
+    def info(*a, **kw):
+        """Chatter: config table, counts, summary. Silenced by --quiet."""
+        if not quiet:
+            print(*a, **kw)
+
+    def note(msg):
+        """Per-file progress. Chatter too, and routed around the progress bar."""
+        if not quiet:
+            alert(msg)
+
+    def alert(msg):
+        """Errors and warnings. --quiet is about noise, not about hiding these."""
+        (tqdm.write if progress else print)(msg)
+
     # ── Rename-only: no conversion pipeline at all ───────────────────────────
     if rename_only:
+        if not dry_run and not confirm_destructive(
+                f"Renaming every image in place as {rename_base}_###", assume_yes):
+            sys.exit(1)
         print()
         print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}✏️  Rename only (in-place){C.RESET}")
         print(f"  {C.BOLD}Input path(s):{C.RESET}")
@@ -1446,7 +1868,10 @@ Examples:
             sys.exit(1)
 
     if replace_mode:
-        tmp_dir      = Path(tempfile.mkdtemp(prefix='imgcrunch_tmp_'))
+        if not dry_run and not confirm_destructive(
+                "Replacing the original files in place", assume_yes):
+            sys.exit(1)
+        tmp_dir      = make_staging_dir(input_paths)
         output_dir   = tmp_dir
         originals_dir = None
     else:
@@ -1463,66 +1888,78 @@ Examples:
             output_dir.mkdir(parents=True, exist_ok=True)
 
     # Print run config
-    print()
+    info()
     if replace_mode:
-        print(f"  {C.BOLD}Mode:{C.RESET}            {C.YELLOW}⚠️  Replace in-place{C.RESET}")
+        info(f"  {C.BOLD}Mode:{C.RESET}            {C.YELLOW}⚠️  Replace in-place{C.RESET}")
     elif merge_mode:
-        print(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}📂  Merge inputs{C.RESET}")
+        info(f"  {C.BOLD}Mode:{C.RESET}            {C.CYAN}📂  Merge inputs{C.RESET}")
     else:
-        print(f"  {C.BOLD}Mode:{C.RESET}            📂  Keep originals")
+        info(f"  {C.BOLD}Mode:{C.RESET}            📂  Keep originals")
         
-    print(f"  {C.BOLD}Input path(s):{C.RESET}")
+    info(f"  {C.BOLD}Input path(s):{C.RESET}")
     for p in input_paths:
-        print(f"    {p}")
+        info(f"    {p}")
         
     if not replace_mode:
         if args.output or merge_mode:
-            print(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
+            info(f"  {C.BOLD}Output folder:{C.RESET}   {output_dir}")
         else:
-            print(f"  {C.BOLD}Output folder:{C.RESET}   <each_source_folder>/converted/")
+            info(f"  {C.BOLD}Output folder:{C.RESET}   <each_source_folder>/converted/")
             
     if args.format == 'original':
-        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}ORIGINAL (copy-only){C.RESET}")
+        info(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}ORIGINAL (copy-only){C.RESET}")
     else:
-        print(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
+        info(f"  {C.BOLD}Format:{C.RESET}          {C.CYAN}{args.format.upper()}{C.RESET} ({fmt['extension']})")
         
     if args.quality:
-        print(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
+        info(f"  {C.BOLD}Quality:{C.RESET}         {args.quality}")
     if lossless:
-        print(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
+        info(f"  {C.BOLD}Lossless:{C.RESET}        {C.CYAN}yes{C.RESET}")
     if target_bytes:
-        print(f"  {C.BOLD}Target size:{C.RESET}     {C.CYAN}{format_bytes(target_bytes)} max{C.RESET}")
+        info(f"  {C.BOLD}Target size:{C.RESET}     {C.CYAN}{format_bytes(target_bytes)} max{C.RESET}")
     if args.max_size == 0:
-        print(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
+        info(f"  {C.BOLD}Resize:{C.RESET}          {C.DIM}convert only / keep size{C.RESET}")
     else:
-        print(f"  {C.BOLD}Max size:{C.RESET}        {args.max_size}px longest side")
+        info(f"  {C.BOLD}Max size:{C.RESET}        {args.max_size}px longest side")
     if rename_base:
-        print(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
+        info(f"  {C.BOLD}Rename:{C.RESET}          {rename_base}_001, {rename_base}_002, ...")
     if skip_dupes:
-        print(f"  {C.BOLD}Skip dupes:{C.RESET}      {C.CYAN}yes (content hash){C.RESET}")
+        info(f"  {C.BOLD}Skip dupes:{C.RESET}      {C.CYAN}yes (content hash){C.RESET}")
     if strip:
-        print(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
+        info(f"  {C.BOLD}Privacy:{C.RESET}         {C.YELLOW}strip EXIF metadata{C.RESET}")
     if post_hook:
-        print(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
-    print(f"  {C.BOLD}Workers:{C.RESET}         {MAX_WORKERS}")
+        info(f"  {C.BOLD}Post-hook:{C.RESET}       {C.DIM}{post_hook}{C.RESET}")
+    info(f"  {C.BOLD}Workers:{C.RESET}         {workers}")
     if not replace_mode and not args.no_move and not merge_mode:
-        print(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
-    print(f"{C.DIM}{'─' * 60}{C.RESET}")
+        info(f"  {C.BOLD}Originals:{C.RESET}       → <each_source_folder>/originals/")
+    info(f"{C.DIM}{'─' * 60}{C.RESET}")
 
     # Find images
+    #
+    # Everything in this phase runs once per file, so per-file syscalls add up:
+    # on 10,000 files resolve() alone - an lstat for every path component -
+    # took over a second before the progress bar appeared. Anything that is
+    # the same for every file is computed once, and input roots are cached.
     all_images_with_sizes = find_images_from_paths(input_paths)
     images_with_sizes = []
     explicit_files = {p.resolve() for p in input_paths if p.is_file()}
+    output_arg_dir = Path(args.output).resolve() if args.output else None
+    roots: dict[Path, Path] = {}
+
+    def root_of(img: Path) -> Path:
+        if img not in roots:
+            roots[img] = get_input_root(img, input_paths)
+        return roots[img]
 
     for img, sz in all_images_with_sizes:
-        if img.resolve() in explicit_files:
+        if explicit_files and img.resolve() in explicit_files:
             images_with_sizes.append((img, sz))
             continue
 
-        root = get_input_root(img, input_paths)
+        root = root_of(img)
         exclude_dirs = []
         if args.output:
-            exclude_dirs.append(str(Path(args.output).resolve()))
+            exclude_dirs.append(str(output_arg_dir))
         elif merge_mode:
             exclude_dirs.append(str(output_dir))
         else:
@@ -1533,7 +1970,7 @@ Examples:
             images_with_sizes.append((img, sz))
 
     if not images_with_sizes:
-        print(f"{C.YELLOW}No images found!{C.RESET}")
+        info(f"{C.YELLOW}No images found!{C.RESET}")
         if replace_mode:
             tmp_dir.rmdir()
         sys.exit(0)
@@ -1541,7 +1978,7 @@ Examples:
     # Disk space preflight (#13)
     disk_err = preflight_disk_check(images_with_sizes, output_dir)
     if disk_err:
-        print(f"\n  {C.RED}❌  {disk_err}{C.RESET}\n")
+        info(f"\n  {C.RED}❌  {disk_err}{C.RESET}\n")
         if replace_mode:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.exit(1)
@@ -1552,11 +1989,11 @@ Examples:
     # Duplicate detection (#14)
     dupe_paths: set[str] = set()
     if skip_dupes:
-        print(f"  {C.DIM}Hashing files for duplicate detection...{C.RESET}", end='', flush=True)
+        info(f"  {C.DIM}Hashing files for duplicate detection...{C.RESET}", end='', flush=True)
         dupe_paths = build_duplicate_set(images)
-        print(f"\r  {C.DIM}Found {len(dupe_paths)} duplicate(s) to skip{C.RESET}          ")
+        info(f"\r  {C.DIM}Found {len(dupe_paths)} duplicate(s) to skip{C.RESET}          ")
 
-    print(f"  Found {C.BOLD}{len(images)}{C.RESET} images  "
+    info(f"  Found {C.BOLD}{len(images)}{C.RESET} images  "
           f"{f'({len(dupe_paths)} dupes will be skipped)' if dupe_paths else ''}\n")
 
     stats = BatchStats()
@@ -1575,7 +2012,7 @@ Examples:
     tasks: list[tuple[Path, Path, int]] = []
     seen_outputs = set()
     for idx, img_path in enumerate(images_to_process, start=1):
-        input_root = get_input_root(img_path, input_paths)
+        input_root = root_of(img_path)
         target_ext = img_path.suffix if args.format == 'original' else fmt['extension']
 
         if replace_mode:
@@ -1583,7 +2020,7 @@ Examples:
             # afterwards. Avoids leaving an empty converted/ in the source.
             target_out_dir = output_dir
         elif args.output:
-            target_out_dir = Path(args.output).resolve()
+            target_out_dir = output_arg_dir
         elif merge_mode:
             target_out_dir = output_dir
         else:
@@ -1592,10 +2029,15 @@ Examples:
         output_path = get_output_path(
             img_path, target_out_dir, input_root if not merge_mode else None, target_ext,
             rename_base=rename_base, rename_index=idx, total_count=len(images_to_process),
-            merge_mode=merge_mode, create_dirs=not dry_run
+            merge_mode=merge_mode, create_dirs=False
         )
-        
-        if output_path.resolve() == img_path.resolve():
+
+        # Never write an output onto its own source. A plain comparison covers
+        # the ordinary case; the samefile check catches the same file reached
+        # another way (a symlinked -o) and only costs a stat when the output
+        # already exists, which is the only way it could be the source.
+        if output_path == img_path or (output_path.exists()
+                                       and os.path.samefile(output_path, img_path)):
             continue
             
         if merge_mode and not rename_base:
@@ -1609,6 +2051,11 @@ Examples:
         seen_outputs.add(output_path)
         file_size = image_sizes.get(str(img_path), 0)
         tasks.append((img_path, output_path, file_size))
+
+    # One mkdir per distinct folder instead of one per file.
+    if not dry_run:
+        for folder in {out.parent for _, out, _ in tasks}:
+            folder.mkdir(parents=True, exist_ok=True)
 
     # Dry run: report the plan and exit without writing, moving, or replacing.
     if dry_run:
@@ -1633,7 +2080,7 @@ Examples:
 
     start_time = time.time()
 
-    if TQDM_AVAILABLE:
+    if TQDM_AVAILABLE and not quiet:
         progress = tqdm(
             total=len(tasks),
             desc=f"  {C.CYAN}Processing{C.RESET}",
@@ -1648,9 +2095,10 @@ Examples:
         progress = None
 
     output_paths_written: list[Path] = []
+    interrupted = False
 
     # ProcessPoolExecutor for CPU-bound encode/resize (#1)
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         job_settings = JobSettings(
             format_key=args.format,
             quality=args.quality,
@@ -1669,92 +2117,141 @@ Examples:
             future_to_path[future] = img_path
 
         completed_tasks = 0
-        for future in as_completed(future_to_path):
-            completed_tasks += 1
-            img_path = future_to_path[future]
-            pct = int(completed_tasks / len(tasks) * 100)
-            set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
+        try:
+            for future in as_completed(future_to_path):
+                completed_tasks += 1
+                img_path = future_to_path[future]
+                pct = int(completed_tasks / len(tasks) * 100)
+                set_terminal_title(f"[ImgCrunch] {pct}% - {completed_tasks}/{len(tasks)} images")
             
-            result: ProcessResult = future.result()
-
-            if result.error:
-                msg = f"  {C.RED}✗{C.RESET} {img_path.name}: {result.error}"
-                (tqdm.write if progress else print)(msg)
-                stats.errors += 1
-
-            else:
-                stats.processed          += 1
-                if result.skipped:
-                    # Already-optimal file: copied through untouched, but it
-                    # still gets moved/replaced like any other output.
-                    stats.skipped += 1
-                stats.total_input_bytes  += result.input_bytes
-                stats.total_output_bytes += result.output_bytes
-
-                # Per-format breakdown accumulation (#20)
-                fdata = stats.by_format[result.input_format]
-                fdata['count'] += 1
-                fdata['in']    += result.input_bytes
-                fdata['out']   += result.output_bytes
-
-                if result.resized:
-                    stats.resized += 1
-                    orig = result.original_size
-                    new  = result.new_size
-                    msg  = (
-                        f"  {C.GREEN}✓{C.RESET} {C.DIM}Resized{C.RESET} {img_path.name} "
-                        f"{C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
+                try:
+                    result: ProcessResult = future.result()
+                except Exception as exc:
+                    # The worker never returned a result: the OS killed it -
+                    # typically for running out of memory - or the pool broke.
+                    # Book it like any failed image, so its original stays put
+                    # and the rest of the batch still gets reported.
+                    result = ProcessResult(
+                        input=str(img_path), output='', input_format=img_path.suffix.lower(),
+                        error=(f"worker process died ({type(exc).__name__}) \u2014 often out "
+                               f"of memory; try again with fewer --workers"),
                     )
-                    (tqdm.write if progress else print)(msg)
 
-                if result.warning:
-                    warn = f"  {C.YELLOW}⚠ {img_path.name}: {result.warning}{C.RESET}"
-                    (tqdm.write if progress else print)(warn)
+                if result.error:
+                    reason = humanize_error(result.error)
+                    msg = f"  {C.RED}✗{C.RESET} {img_path.name}: {reason}"
+                    alert(msg)
+                    stats.errors += 1
+                    stats.failures.append((img_path.name, reason))
 
-                output_path = Path(result.output)
-                output_paths_written.append(output_path)
+                else:
+                    stats.processed          += 1
+                    if result.skipped:
+                        # Already-optimal file: copied through untouched, but it
+                        # still gets moved/replaced like any other output.
+                        stats.skipped += 1
+                    stats.total_input_bytes  += result.input_bytes
+                    stats.total_output_bytes += result.output_bytes
+
+                    # Per-format breakdown accumulation (#20)
+                    fdata = stats.by_format[result.input_format]
+                    fdata['count'] += 1
+                    fdata['in']    += result.input_bytes
+                    fdata['out']   += result.output_bytes
+
+                    if result.resized:
+                        stats.resized += 1
+                        orig = result.original_size
+                        new  = result.new_size
+                        msg  = (
+                            f"  {C.GREEN}✓{C.RESET} {C.DIM}Resized{C.RESET} {img_path.name} "
+                            f"{C.DIM}({orig[0]}x{orig[1]} → {new[0]}x{new[1]}){C.RESET}"
+                        )
+                        note(msg)
+
+                    if result.warning:
+                        warn = f"  {C.YELLOW}⚠ {img_path.name}: {result.warning}{C.RESET}"
+                        alert(warn)
+
+                    output_path = Path(result.output)
+                    output_paths_written.append(output_path)
+
+                    if progress:
+                        progress.set_postfix_str(img_path.name[-30:], refresh=False)
+
+                    # Post-hook (#18) — shell-quote paths to avoid injection/breakage
+                    if post_hook:
+                        cmd = (post_hook
+                               .replace('{in}', shlex.quote(str(img_path)))
+                               .replace('{out}', shlex.quote(str(output_path))))
+                        try:
+                            # stderr is captured, not discarded: a hook that exits
+                            # non-zero used to vanish without a trace, so a broken
+                            # hook looked exactly like a working one.
+                            hook = subprocess.run(cmd, shell=True, timeout=30,
+                                                  stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.PIPE, text=True)
+                            if hook.returncode != 0:
+                                lines = (hook.stderr or '').strip().splitlines()
+                                detail = f" — {lines[0]}" if lines else ""
+                                warn = (f"  {C.YELLOW}⚠ post-hook exited with "
+                                        f"{hook.returncode} for {img_path.name}"
+                                        f"{detail}{C.RESET}")
+                                alert(warn)
+                                stats.post_errors += 1
+                        except Exception as hook_err:
+                            warn = (f"  {C.YELLOW}⚠ post-hook failed for "
+                                    f"{img_path.name}: {hook_err}{C.RESET}")
+                            alert(warn)
+                            stats.post_errors += 1
+
+                    if replace_mode:
+                        try:
+                            final_ext = (img_path.suffix if args.format == 'original'
+                                         else fmt['extension'])
+                            replace_original(img_path, Path(result.output), final_ext)
+                            stats.replaced += 1
+                        except Exception as e:
+                            msg = (f"  {C.RED}✗{C.RESET} {img_path.name}: "
+                                   f"could not replace original: {e}")
+                            alert(msg)
+                            stats.post_errors += 1
+                            stats.failures.append(
+                                (img_path.name, f"could not replace original: {e}"))
+                    elif not args.no_move:
+                        try:
+                            input_root = get_input_root(img_path, input_paths)
+                            specific_originals_dir = input_root / 'originals'
+                            move_to_originals(img_path, specific_originals_dir, input_root)
+                            stats.moved += 1
+                        except Exception as e:
+                            warn = (f"  {C.YELLOW}⚠ Could not move {img_path.name} "
+                                    f"to originals/: {e}{C.RESET}")
+                            alert(warn)
+                            stats.post_errors += 1
+                            stats.failures.append(
+                                (img_path.name, f"could not move to originals/: {e}"))
 
                 if progress:
-                    progress.set_postfix_str(img_path.name[-30:], refresh=False)
-
-                # Post-hook (#18) — shell-quote paths to avoid injection/breakage
-                if post_hook:
-                    cmd = (post_hook
-                           .replace('{in}', shlex.quote(str(img_path)))
-                           .replace('{out}', shlex.quote(str(output_path))))
-                    try:
-                        subprocess.run(cmd, shell=True, timeout=30,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception as hook_err:
-                        warn = f"  {C.YELLOW}⚠ post-hook failed for {img_path.name}: {hook_err}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-
-                if replace_mode:
-                    try:
-                        converted_path = Path(result.output)
-                        final_ext = img_path.suffix if args.format == 'original' else fmt['extension']
-                        final_path     = img_path.with_suffix(final_ext)
-                        img_path.unlink()
-                        shutil.move(str(converted_path), str(final_path))
-                        stats.replaced += 1
-                    except Exception as e:
-                        warn = f"  {C.YELLOW}⚠ Could not replace {img_path.name}: {e}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-                elif not args.no_move:
-                    try:
-                        input_root = get_input_root(img_path, input_paths)
-                        specific_originals_dir = input_root / 'originals'
-                        move_to_originals(img_path, specific_originals_dir, input_root)
-                        stats.moved += 1
-                    except Exception as e:
-                        warn = f"  {C.YELLOW}⚠ Could not move {img_path.name}: {e}{C.RESET}"
-                        (tqdm.write if progress else print)(warn)
-
-            if progress:
-                progress.update(1)
+                    progress.update(1)
+        except KeyboardInterrupt:
+            # Stop handing out work and stop waiting for what is still running.
+            # Workers finish the image they are on; nothing new starts.
+            interrupted = True
+            executor.shutdown(wait=False, cancel_futures=True)
 
     if progress:
         progress.close()
+
+    if interrupted:
+        if replace_mode:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        print()
+        print(f"  {C.DIM}{cancellation_notice(stats, len(tasks))}{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you're ready. \U0001f44b{C.RESET}")
+        print()
+        set_terminal_title("[ImgCrunch] Cancelled")
+        sys.exit(130)
 
     set_terminal_title("[ImgCrunch] Done")
 
@@ -1767,6 +2264,32 @@ Examples:
     if IS_MACOS and output_paths_written:
         refresh_quicklook(output_paths_written)
 
+    # Remember what was used, so the wizard can offer it as "Last run". Dry
+    # runs, rename-only and interrupted runs never get this far; a plain copy
+    # has no encoding settings worth reusing.
+    if args.format != 'original':
+        try:
+            presets.save_last_run({
+                'format':      args.format,
+                'quality':     args.quality,
+                'max_size':    args.max_size,
+                'target_size': target_size_arg,
+                'strip':       strip,
+                'lossless':    lossless,
+            })
+        except OSError:
+            # A convenience for next time; never fail a finished batch over it.
+            pass
+
+    # 1 if anything failed - an image, or a replace, move or post-hook after it -
+    # so scripts can tell without parsing the output. Warnings do not count.
+    exit_code = 1 if (stats.errors or stats.post_errors) else 0
+
+    if quiet:
+        # Individual failures were already printed as they happened; the exit
+        # code carries the rest.
+        return exit_code
+
     print_summary(stats, elapsed, output_dir)
     if replace_mode:
         print(f"\n  {C.BOLD}Files replaced in place.{C.RESET}\n")
@@ -1778,13 +2301,30 @@ Examples:
         else:
             print(f"\n  {C.BOLD}Outputs saved to respective '<folder>/converted/' directories.{C.RESET}\n")
 
+    return exit_code
 
-if __name__ == '__main__':
+
+def cli() -> None:
+    """
+    Console-script entry point (see pyproject.toml).
+
+    Exit codes: 0 success, 1 something failed (or a destructive run was not
+    confirmed), 2 a usage error, 130 cancelled during the batch.
+
+    An interrupt during the batch is handled inside main(), where the counters
+    are. One that arrives earlier - in the wizard, while scanning - lands here,
+    and at that point nothing has been touched yet.
+    """
     try:
-        main()
+        code = main()
     except KeyboardInterrupt:
         print()
         print(f"  {C.DIM}Cancelled — nothing was changed.{C.RESET}")
-        print(f"  {C.DIM}Run imgcrunch again whenever you\'re ready. 👋{C.RESET}")
+        print(f"  {C.DIM}Run imgcrunch again whenever you're ready. 👋{C.RESET}")
         print()
         sys.exit(0)
+    sys.exit(code)
+
+
+if __name__ == '__main__':
+    cli()

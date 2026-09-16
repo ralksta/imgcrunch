@@ -5,6 +5,8 @@ Covers pure helpers (fast) and a few end-to-end process_image / CLI
 integration tests (generate real images with Pillow into tmp dirs).
 """
 
+import gc
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,9 +14,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import imgcrunch as ic  # noqa: E402
+import imgcrunch as ic
 
 
 def job(format_key="jpeg", quality=85, max_size=3000, **kwargs):
@@ -74,8 +74,14 @@ class TestNeedsResize:
 
 class TestDetectDominantFormat:
     def test_dominant(self, tmp_path):
+        imgs = [tmp_path / f"a{i}.jpg" for i in range(6)] + [tmp_path / "b.png"]
+        assert ic.detect_dominant_format(imgs) == "jpeg"
+
+    def test_png_folder_suggests_a_format_that_keeps_transparency(self, tmp_path):
+        # PNG used to map to JPEG, so the wizard's default for a folder of
+        # PNGs flattened every transparent pixel onto white without a word.
         imgs = [tmp_path / f"a{i}.png" for i in range(6)] + [tmp_path / "b.jpg"]
-        assert ic.detect_dominant_format(imgs) == "jpeg"  # png maps to jpeg
+        assert ic.detect_dominant_format(imgs) == "webp"
 
     def test_no_majority_falls_back(self, tmp_path):
         imgs = [tmp_path / "a.heic", tmp_path / "b.webp", tmp_path / "c.avif"]
@@ -190,11 +196,9 @@ class TestProcessImage:
 
     def test_strip_removes_exif(self, tmp_path):
         # Build a jpeg carrying an EXIF orientation tag, then strip it.
-        import piexif
         src = tmp_path / "src.jpg"
         _make_image(src, size=(400, 300))
-        exif_dict = {"0th": {piexif.ImageIFD.Orientation: 6}}
-        piexif.insert(piexif.dump(exif_dict), str(src))
+        _tag_orientation(src, 6)   # Pillow writes the tag; no piexif needed
 
         out = tmp_path / "out.jpg"
         res = ic.process_image(str(src), str(out), job(strip_exif=True))
@@ -205,17 +209,23 @@ class TestProcessImage:
     def test_strip_bakes_orientation(self, tmp_path):
         # Orientation 6 = rotate 90deg. A 400x300 image tagged '6' should,
         # after stripping, have its pixels physically rotated to 300x400.
-        import piexif
         src = tmp_path / "src.jpg"
         _make_image(src, size=(400, 300))
-        exif_dict = {"0th": {piexif.ImageIFD.Orientation: 6}}
-        piexif.insert(piexif.dump(exif_dict), str(src))
+        _tag_orientation(src, 6)   # Pillow writes the tag; no piexif needed
 
         out = tmp_path / "out.jpg"
         res = ic.process_image(str(src), str(out), job(strip_exif=True))
         assert res.error is None
         with Image.open(out) as im:
             assert im.size == (300, 400), "orientation must be baked into pixels"
+
+
+def _tag_orientation(path, value):
+    """Rewrite a JPEG with an EXIF orientation tag, using Pillow only."""
+    with Image.open(path) as im:
+        exif = Image.Exif()
+        exif[0x0112] = value
+        im.save(path, exif=exif.tobytes())
 
 
 # ── CLI integration: rename numbering has no gaps around dupes ────────────────
@@ -262,7 +272,7 @@ class TestReplaceMode:
         keep = tmp_path / "keep.jpg"          # already optimal -> skip/copy-through
         Image.new("RGB", (4000, 1000), (9, 9, 9)).save(big)
         Image.new("RGB", (500, 500), (1, 2, 3)).save(keep)
-        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace")
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace", "--yes")
         assert r.returncode == 0, r.stderr
         assert not (tmp_path / "converted").exists()
         assert not (tmp_path / "originals").exists()
@@ -402,7 +412,7 @@ class TestRenameOnlyCLI:
         Image.new("RGB", (300, 300), (0, 0, 255)).save(b)
         before_a = a.read_bytes()
 
-        r = self._run(str(tmp_path), "--rename-only", "--rename", "urlaub")
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "urlaub", "--yes")
         assert r.returncode == 0, r.stderr
         assert not (tmp_path / "converted").exists()
         assert not (tmp_path / "originals").exists()
@@ -765,3 +775,1471 @@ class TestWizardFlagRejection:
         r = self._run("--wizard", str(tmp_path), "--strip")
         assert r.returncode != 0
         assert "--strip" in (r.stdout + r.stderr)
+
+
+# ── replace_original: the original must survive a failed move ────────────────
+
+class TestReplaceOriginal:
+    """
+    The replace path used to unlink the original *before* moving the new file
+    into place, so a failing move destroyed the image with nothing to show for
+    it. These tests pin the ordering down.
+    """
+
+    def _staged(self, tmp_path, name, content):
+        staged_dir = tmp_path / "staging"
+        staged_dir.mkdir(exist_ok=True)
+        staged = staged_dir / name
+        staged.write_bytes(content)
+        return staged
+
+    def test_original_survives_failed_move(self, tmp_path, monkeypatch):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.webp", b"NEW")
+
+        def boom(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(ic.os, "replace", boom)
+        monkeypatch.setattr(ic.shutil, "move", boom)
+
+        with pytest.raises(OSError):
+            ic.replace_original(original, staged, ".webp")
+
+        assert original.exists(), "original was destroyed by a failed move"
+        assert original.read_bytes() == b"ORIGINAL"
+
+    def test_format_change_drops_the_old_file(self, tmp_path):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.webp", b"NEW")
+
+        final = ic.replace_original(original, staged, ".webp")
+
+        assert final == tmp_path / "photo.webp"
+        assert final.read_bytes() == b"NEW"
+        assert not original.exists()
+
+    def test_same_extension_overwrites_in_place(self, tmp_path):
+        original = tmp_path / "photo.jpg"
+        original.write_bytes(b"ORIGINAL")
+        staged = self._staged(tmp_path, "photo.jpg", b"NEW")
+
+        final = ic.replace_original(original, staged, ".jpg")
+
+        assert final == original
+        assert original.read_bytes() == b"NEW"
+
+
+# ── make_staging_dir: same volume as the images, or we lose atomicity ─────────
+
+class TestMakeStagingDir:
+    def test_sits_next_to_the_input(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+
+        staging = ic.make_staging_dir([src])
+        try:
+            assert staging.parent == src.parent, (
+                "staging must share a volume with the images so the replace "
+                "is a rename, not a full copy"
+            )
+        finally:
+            staging.rmdir()
+
+    def test_falls_back_when_input_parent_is_not_writable(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        tmp_path.chmod(0o500)
+
+        try:
+            staging = ic.make_staging_dir([src])
+        finally:
+            tmp_path.chmod(0o700)
+
+        try:
+            assert staging.exists()
+            assert staging.parent != src.parent
+        finally:
+            staging.rmdir()
+
+
+# ── Error accounting: failures after a successful encode must be counted ──────
+
+class TestErrorAccounting:
+    """
+    stats.errors only ever counted worker failures. A replace or a move that
+    blew up printed a yellow warning and was then forgotten, so the closing
+    line under-reported what had actually gone wrong.
+    """
+
+    def test_summary_reports_post_errors(self, capsys, tmp_path):
+        stats = ic.BatchStats()
+        stats.processed = 3
+        stats.post_errors = 2
+
+        ic.print_summary(stats, 1.0, tmp_path)
+
+        out = capsys.readouterr().out
+        assert "2" in out
+        assert "after" in out.lower() or "replac" in out.lower() or "mov" in out.lower()
+
+    def test_failed_replace_is_counted_and_keeps_the_original(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        img = tmp_path / "photo.jpg"
+        Image.new("RGB", (4000, 1000), (9, 9, 9)).save(img)
+        before = img.read_bytes()
+
+        def boom(*args, **kwargs):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(ic, "replace_original", boom)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["imgcrunch", str(tmp_path), "-f", "jpeg", "-m", "2000", "--replace", "--yes"],
+        )
+
+        ic.main()
+
+        out = capsys.readouterr().out
+        assert "could not replace" in out.lower()
+        assert img.exists(), "original must survive a failed replace"
+        assert img.read_bytes() == before
+
+
+# ── Post-hook: a non-zero exit must not pass silently ────────────────────────
+
+class TestPostHook:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def test_failing_hook_is_reported(self, tmp_path):
+        Image.new("RGB", (800, 600), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move",
+                      "--post-hook", "echo boom >&2; exit 3")
+
+        assert r.returncode == 1, "a failing hook is a failed step (see TestExitCode)"
+        combined = (r.stdout + r.stderr).lower()
+        # "post-hook" and "3" both appear in the echoed config line, so assert
+        # on wording that can only come from the failure report itself.
+        assert "exited with 3" in combined
+        assert "a.jpg" in combined
+
+    def test_successful_hook_stays_quiet(self, tmp_path):
+        Image.new("RGB", (800, 600), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move",
+                      "--post-hook", "true")
+
+        assert r.returncode == 0, r.stderr
+        assert "exited with" not in (r.stdout + r.stderr).lower()
+
+
+# ── Ctrl+C must describe what actually happened ──────────────────────────────
+
+class TestCancellationNotice:
+    """
+    The interrupt handler printed "nothing was changed" unconditionally, which
+    is a lie once files have been replaced or moved. It sat outside main() and
+    had no access to the counters; the text now comes from them.
+    """
+
+    def test_nothing_written_says_so(self):
+        msg = ic.cancellation_notice(ic.BatchStats(), total=20)
+
+        assert "nothing was changed" in msg.lower()
+
+    def test_replaced_files_are_named(self):
+        stats = ic.BatchStats()
+        stats.processed = 7
+        stats.replaced = 7
+
+        msg = ic.cancellation_notice(stats, total=20)
+
+        assert "nothing was changed" not in msg.lower()
+        assert "7" in msg and "20" in msg
+        assert "replac" in msg.lower()
+
+    def test_moved_originals_are_named(self):
+        stats = ic.BatchStats()
+        stats.processed = 4
+        stats.moved = 4
+
+        msg = ic.cancellation_notice(stats, total=9)
+
+        assert "nothing was changed" not in msg.lower()
+        assert "originals" in msg.lower()
+        assert "4" in msg
+
+    def test_interrupt_mid_batch_reports_progress(self, tmp_path, monkeypatch, capsys):
+        for i in range(3):
+            Image.new("RGB", (900, 700), (i * 40, i * 40, i * 40)).save(
+                tmp_path / f"p{i}.jpg"
+            )
+
+        real_move = ic.move_to_originals
+        seen = {"n": 0}
+
+        def interrupt_after_first(*args, **kwargs):
+            seen["n"] += 1
+            if seen["n"] > 1:
+                raise KeyboardInterrupt
+            return real_move(*args, **kwargs)
+
+        monkeypatch.setattr(ic, "move_to_originals", interrupt_after_first)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "jpeg"])
+
+        with pytest.raises(SystemExit):
+            ic.main()
+
+        out = capsys.readouterr().out.lower()
+        assert "cancelled" in out
+        assert "nothing was changed" not in out, (
+            "one original had already been moved when the interrupt arrived"
+        )
+
+
+# ── Destructive runs need consent ────────────────────────────────────────────
+
+class TestDestructiveConfirmation:
+    """
+    --replace and --rename-only are irreversible and used to run without a word
+    of warning outside the wizard. Without a TTY to ask on, they now need --yes.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_replace_aborts_without_consent(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(img)
+        before = img.read_bytes()
+
+        r = self._run(str(tmp_path), "-f", "webp", "--replace")
+
+        assert r.returncode != 0
+        assert "--yes" in r.stdout + r.stderr
+        assert img.exists() and img.read_bytes() == before
+
+    def test_replace_proceeds_with_yes(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(img)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "400", "--replace", "--yes")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(img) as im:
+            assert max(im.size) == 400
+
+    def test_rename_only_aborts_without_consent(self, tmp_path):
+        img = tmp_path / "a.jpg"
+        Image.new("RGB", (300, 200), (4, 5, 6)).save(img)
+
+        r = self._run(str(tmp_path), "--rename-only", "--rename", "trip")
+
+        assert r.returncode != 0
+        assert "--yes" in r.stdout + r.stderr
+        assert img.exists(), "the original name must survive"
+
+    def test_dry_run_needs_no_consent(self, tmp_path):
+        Image.new("RGB", (900, 700), (4, 5, 6)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--replace", "--dry-run")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ── The wizard must not default to yes on a destructive run ──────────────────
+
+class TestWizardDestructiveDefault:
+    """
+    The final prompt was "(Y/n)" for every mode, so hitting Enter on the
+    replace path overwrote every original. A default must never be the
+    irreversible option.
+    """
+
+    def test_replace_needs_an_explicit_yes(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"(1/2/3)": "2"})
+
+        assert result is None, "Enter must not start a replace run"
+
+    def test_replace_starts_on_an_explicit_yes(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(
+            monkeypatch, wizard_dir, {"(1/2/3)": "2", "start processing": "y"}
+        )
+
+        assert result is not None
+        assert result["replace"] is True
+
+    def test_keep_originals_still_starts_on_enter(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result is not None, "the safe path should keep its Enter default"
+        assert result["replace"] is False
+
+
+# ── --args-file: the Quick Action path must fail honestly ────────────────────
+
+class TestArgsFile:
+    """
+    --args-file is how the macOS Quick Action hands the Finder selection over.
+    A read failure used to print a line and carry on with the flag still in
+    argv, so the user was told "--args-file cannot be combined with --wizard"
+    for a flag they never typed.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_missing_file_names_the_real_problem(self, tmp_path):
+        r = self._run("--wizard", "--args-file", str(tmp_path / "gone.txt"))
+
+        assert r.returncode == 2
+        out = r.stdout + r.stderr
+        assert "cannot be combined" not in out, "that is not what went wrong"
+        assert "args-file" in out.lower()
+
+    def test_expands_one_argument_per_line(self, tmp_path):
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(tmp_path / "a.jpg")
+        args_file = tmp_path / "args.txt"
+        args_file.write_text(f"{tmp_path}\n--dry-run\n")
+
+        r = self._run("--args-file", str(args_file))
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "dry" in r.stdout.lower()
+        assert not args_file.exists(), "the temp args file should be cleaned up"
+
+
+# ── Failures should be readable, and you should learn which files ────────────
+
+class TestErrorReporting:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_humanize_explains_an_unreadable_file(self):
+        out = ic.humanize_error("cannot identify image file '/x/a.jpg'")
+
+        assert "cannot identify image file" not in out
+        assert "readable" in out.lower() or "damaged" in out.lower()
+
+    def test_humanize_leaves_a_clear_message_alone(self):
+        msg = "cannot reach target size 500.0 KB"
+
+        assert ic.humanize_error(msg) == msg
+
+    def test_summary_names_the_failing_files(self, tmp_path):
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(tmp_path / "good.jpg")
+        (tmp_path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move")
+        out = r.stdout + r.stderr
+        summary = out.split("Processing Summary")[-1]
+
+        assert "bad.jpg" in summary, "the summary should name what failed"
+        assert "good.jpg" not in summary
+
+
+# ── Quick Look refresh must not nuke the system-wide cache ───────────────────
+
+class TestRefreshQuicklook:
+    def test_touches_files_without_killing_the_shared_cache(self, tmp_path, monkeypatch):
+        if not ic.IS_MACOS:
+            pytest.skip("macOS only")
+
+        ran = []
+        monkeypatch.setattr(ic.subprocess, "run",
+                            lambda *a, **k: ran.append(a) or None)
+        target = tmp_path / "a.jpg"
+        target.write_bytes(b"x")
+        target.touch()
+        before = target.stat().st_mtime_ns
+
+        ic.refresh_quicklook([target])
+
+        assert not any("qlmanage" in str(call) for call in ran), (
+            "qlmanage -r cache invalidates Quick Look for the whole system"
+        )
+        assert target.stat().st_mtime_ns >= before
+
+
+# ── A dropped EXIF block is data loss and must be said out loud ──────────────
+
+class TestExifFailureIsReported:
+    def test_unreadable_exif_produces_a_warning(self, tmp_path, monkeypatch):
+        # This failure path only exists when piexif parses the EXIF block.
+        pytest.importorskip("piexif")
+        src = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (1, 2, 3)).save(src)
+
+        def boom(*args, **kwargs):
+            raise ValueError("corrupt exif block")
+
+        monkeypatch.setattr(ic.piexif, "load", boom)
+
+        result = ic.process_image(str(src), str(tmp_path / "out.jpg"),
+                                  job(max_size=400))
+
+        assert result.error is None
+        assert result.warning and "exif" in result.warning.lower()
+
+
+# ── --quiet: everything but the problems ─────────────────────────────────────
+
+class TestQuiet:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_suppresses_the_running_commentary(self, tmp_path):
+        Image.new("RGB", (2400, 1800), (1, 2, 3)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "-m", "600", "--no-move", "--quiet")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Workers:" not in r.stdout
+        assert "Processing Summary" not in r.stdout
+        assert "Resized" not in r.stdout, "per-file progress is chatter too"
+        assert (tmp_path / "converted" / "a.jpg").exists(), "it still has to work"
+
+    def test_still_reports_failures(self, tmp_path):
+        (tmp_path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move", "--quiet")
+
+        assert "bad.jpg" in r.stdout + r.stderr, "errors must survive --quiet"
+
+
+class TestCancellationMentionsInflightOutputs:
+    """
+    Cancelling stops the consumer loop, but workers already running finish the
+    image they are on. A run cancelled at 14 of 50 can leave far more than 14
+    outputs on disk, so the notice must not imply otherwise.
+    """
+
+    def test_warns_that_more_outputs_may_exist(self):
+        stats = ic.BatchStats()
+        stats.processed = 14
+        stats.moved = 14
+
+        msg = ic.cancellation_notice(stats, total=50)
+
+        assert "in flight" in msg.lower() or "already running" in msg.lower()
+
+
+# ── The wizard and argparse must describe the same settings ──────────────────
+
+class TestWizardArgparseAgreement:
+    """
+    The wizard returns a dict that main() turns straight into an
+    argparse.Namespace. Every key therefore has to match an argparse dest, and
+    nothing enforced that: main() reads the settings back with
+    getattr(args, ..., default), so a typo in the wizard dict silently became
+    "user did not ask for this" instead of an error.
+    """
+
+    def _wizard_keys(self, monkeypatch, wizard_dir, answers=None):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, answers)
+        assert result is not None
+        return set(result)
+
+    def test_normal_run_keys_all_exist_in_the_parser(self, monkeypatch, wizard_dir):
+        dests = {a.dest for a in ic.build_parser()._actions}
+
+        assert self._wizard_keys(monkeypatch, wizard_dir) <= dests
+
+    def test_rename_only_keys_all_exist_in_the_parser(self, monkeypatch, wizard_dir):
+        dests = {a.dest for a in ic.build_parser()._actions}
+        keys = self._wizard_keys(monkeypatch, wizard_dir,
+                                 {"(1/2/3)": "3", "base name": "urlaub"})
+
+        assert keys <= dests
+
+    def test_both_wizard_exits_return_the_same_keys(self, monkeypatch, wizard_dir):
+        normal = self._wizard_keys(monkeypatch, wizard_dir)
+        renaming = self._wizard_keys(monkeypatch, wizard_dir,
+                                     {"(1/2/3)": "3", "base name": "urlaub"})
+
+        assert normal == renaming, (
+            "the two return statements have drifted apart"
+        )
+
+
+# ── Which paths skip the format question (characterisation before refactor) ──
+
+@pytest.fixture
+def two_files(tmp_path):
+    a = tmp_path / "one.jpg"
+    b = tmp_path / "two.jpg"
+    Image.new("RGB", (900, 700), (200, 40, 40)).save(a)
+    Image.new("RGB", (640, 480), (40, 200, 40)).save(b)
+    return [a, b]
+
+
+def _drive_wizard_paths(monkeypatch, paths, answers=None):
+    import re as _re
+
+    answers = dict(answers or {})
+    seen = []
+
+    def fake_input(prompt=""):
+        plain = _re.sub(r"\033\[[0-9;]*m", "", str(prompt)).lower()
+        seen.append(plain)
+        for needle, reply in answers.items():
+            if needle in plain:
+                return reply.pop(0) if isinstance(reply, list) else reply
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return ic.startup_wizard(prefills=[str(p) for p in paths]), seen
+
+
+class TestWizardFormatQuestionReach:
+    def _asked_for_format(self, seen):
+        return any("1/2/3/4/5" in p for p in seen)
+
+    def test_merge_copy_only_skips_the_format_question(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "1"})
+
+        assert result is not None
+        assert result["format"] == "original"
+        assert not self._asked_for_format(seen)
+
+    def test_merge_and_convert_asks_for_a_format(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "2"})
+
+        assert result is not None
+        assert result["format"] != "original"
+        assert self._asked_for_format(seen)
+
+    def test_rename_only_skips_the_format_question(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(
+            monkeypatch, two_files, {"(1/2/3/4)": "4", "base name": "trip"}
+        )
+
+        assert result is not None
+        assert result["rename_only"] is True
+        assert not self._asked_for_format(seen)
+
+    def test_process_individually_asks_for_a_format(self, monkeypatch, two_files):
+        result, seen = _drive_wizard_paths(monkeypatch, two_files, {"(1/2/3/4)": "3"})
+
+        assert result is not None
+        assert self._asked_for_format(seen)
+
+
+
+# ── Flattening transparency must be announced ────────────────────────────────
+
+class TestAlphaFlattenWarning:
+    def test_transparent_png_into_jpeg_warns(self, tmp_path):
+        src = tmp_path / "logo.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 0), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.jpg"), job())
+
+        assert res.error is None
+        assert res.warning and "transparen" in res.warning.lower()
+
+    def test_fully_opaque_rgba_does_not_warn(self, tmp_path):
+        # An alpha channel that is 255 everywhere loses nothing when flattened.
+        src = tmp_path / "shot.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 255), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.jpg"), job())
+
+        assert res.error is None
+        assert not res.warning
+
+    def test_transparent_png_into_webp_does_not_warn(self, tmp_path):
+        src = tmp_path / "logo.png"
+        _make_image(src, size=(200, 200), color=(0, 255, 0, 0), mode="RGBA")
+
+        res = ic.process_image(str(src), str(tmp_path / "out.webp"), job("webp"))
+
+        assert res.error is None
+        assert not res.warning
+
+
+class TestWizardDefaultsMatchTheCli:
+    def test_enter_on_max_size_uses_the_cli_default(self, monkeypatch, wizard_dir):
+        # The CLI and the README say 3000; the wizard used to treat Enter as
+        # "no resizing", so the same tool resized or didn't depending on the door.
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["max_size"] == ic.DEFAULT_MAX_SIZE
+
+    def test_zero_still_means_no_resizing(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"max longest side": "0"})
+
+        assert result["max_size"] == 0
+
+
+class TestWizardNamesVanishedSelections:
+    def test_missing_prefill_is_named(self, monkeypatch, two_files, capsys):
+        gone = two_files[0].parent / "deleted-meanwhile.jpg"
+
+        result, _ = _drive_wizard_paths(monkeypatch, [*two_files, gone],
+                                        {"(1/2/3/4)": "3"})
+
+        out = capsys.readouterr().out
+        assert result is not None
+        assert "deleted-meanwhile.jpg" in out, "a vanished selection must not be dropped silently"
+
+
+class TestPresetFormatsMatchTheEncoder:
+    def test_presets_know_exactly_the_encodable_formats(self):
+        import presets
+        # presets.py duplicates the list to stay Pillow-free; this keeps it honest.
+        assert set(presets.VALID_FORMATS) == set(ic.FORMAT_CONFIG)
+
+
+# ── Presets in the wizard ────────────────────────────────────────────────────
+
+class TestWizardPresets:
+    ENCODING_PROMPTS = ("1/2/3/4/5", "quality (1-100)", "max longest side",
+                        "max file size", "strip metadata")
+
+    def _asked(self, seen, needle):
+        return any(needle in p for p in seen)
+
+    def test_enter_without_a_last_run_keeps_the_guided_path(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result is not None
+        assert self._asked(seen, "preset")
+        for prompt in self.ENCODING_PROMPTS:
+            assert self._asked(seen, prompt), f"guided path should still ask: {prompt}"
+
+    def test_picking_a_builtin_skips_the_encoding_questions(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir, {"preset": "1"})
+
+        assert result["format"] == "jpeg"
+        assert result["max_size"] == 2000
+        assert result["target_size"] == "500k"
+        assert result["strip"] is True
+        for prompt in self.ENCODING_PROMPTS:
+            assert not self._asked(seen, prompt), f"preset should skip: {prompt}"
+
+    def test_rename_is_still_asked_after_a_preset(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {"preset": "1", "base name": "trip"})
+
+        assert result["rename"] == "trip"
+
+    def test_last_run_is_offered_first_and_is_the_default(self, monkeypatch, wizard_dir):
+        import presets
+        presets.save_last_run({"format": "avif", "quality": 55, "max_size": 2400,
+                               "target_size": "800k", "strip": True, "lossless": False})
+
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["format"] == "avif"
+        assert result["quality"] == 55
+        assert result["max_size"] == 2400
+        assert result["target_size"] == "800k"
+
+    def test_a_preset_never_switches_on_replace(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"preset": "1"})
+
+        assert result["replace"] is False
+
+
+class TestLastRunIsRemembered:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (2400, 1600), (9, 90, 180)).save(src / "a.jpg")
+        return src
+
+    def test_a_finished_run_is_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "-f", "webp", "-q", "70", "-m", "1500",
+                      "--strip", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert presets.load_last_run() == {
+            "format": "webp", "quality": 70, "max_size": 1500,
+            "target_size": None, "strip": True, "lossless": False,
+        }
+
+    def test_dry_run_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "-f", "webp", "--dry-run")
+
+        assert presets.load_last_run() is None
+
+    def test_copy_only_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "-f", "original", "--no-move")
+
+        assert presets.load_last_run() is None, "there is nothing to reuse from a copy"
+
+    def test_rename_only_is_not_saved(self, tmp_path):
+        import presets
+        src = self._photos(tmp_path)
+
+        self._run(str(src), "--rename-only", "--rename", "x", "--yes")
+
+        assert presets.load_last_run() is None
+
+
+class TestPresetFlag:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (3000, 2000), (9, 90, 180)).save(src / "a.jpg", quality=98)
+        return src
+
+    def test_builtin_preset_sets_the_encoding(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        out = src / "converted" / "a.jpg"
+        with Image.open(out) as im:
+            assert max(im.size) == 2000
+        assert out.stat().st_size <= 500 * 1024
+
+    def test_an_explicit_flag_beats_the_preset(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-m", "800", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(src / "converted" / "a.jpg") as im:
+            assert max(im.size) == 800
+
+    def test_last_uses_the_remembered_run(self, tmp_path):
+        import presets
+        presets.save_last_run({"format": "webp", "quality": 60, "max_size": 1000,
+                               "target_size": None, "strip": False, "lossless": False})
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "last", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        with Image.open(src / "converted" / "a.webp") as im:
+            assert max(im.size) == 1000
+
+    def test_last_without_a_remembered_run_says_so(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "last")
+
+        assert r.returncode != 0
+        assert "no previous run" in (r.stdout + r.stderr).lower()
+
+    def test_unknown_preset_is_rejected(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "nope")
+
+        assert r.returncode != 0
+        # "web" would also match "webp" in the usage line; "archive" appears
+        # nowhere but in the list of valid preset names.
+        assert "archive" in r.stderr, "the error should list the valid names"
+
+
+# ── The guided path can reach every encoding option ──────────────────────────
+
+class TestWizardGuidedPathOptions:
+    # Without a remembered run the menu is Web, Archive, Save space, then custom.
+    CUSTOM = {"preset": "4"}
+
+    def test_quality_can_be_chosen(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {**self.CUSTOM, "quality (1-100)": "70"})
+
+        assert result["quality"] == 70
+
+    def test_enter_keeps_the_format_default_quality(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, self.CUSTOM)
+
+        assert result["quality"] == ic.FORMAT_QUALITY_DEFAULTS[result["format"]]
+
+    def test_out_of_range_quality_is_asked_again(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "quality (1-100)": ["150", "60"]})
+
+        assert result["quality"] == 60
+        assert len([p for p in seen if "quality (1-100)" in p]) == 2
+
+    def test_lossless_webp_skips_quality_and_budget(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "1/2/3/4/5": "4", "lossless?": "y"})
+
+        assert result["format"] == "webp"
+        assert result["lossless"] is True
+        assert not any("quality (1-100)" in p for p in seen)
+        assert not any("max file size" in p for p in seen), \
+            "--target-size cannot combine with --lossless"
+
+    def test_lossless_is_not_offered_for_jpeg(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "1/2/3/4/5": "1"})
+
+        assert not any("lossless?" in p for p in seen)
+        assert result["lossless"] is False
+
+    def test_duplicates_can_be_skipped(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {**self.CUSTOM, "duplicates?": "y"})
+
+        assert result["skip_dupes"] is True
+
+
+class TestWizardDryRunFromConfirmation:
+    def test_d_at_the_confirmation_means_dry_run(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"start processing": "d"})
+
+        assert result is not None
+        assert result["dry_run"] is True
+
+    def test_d_works_after_a_preset_too(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {"preset": "1", "start processing": "d"})
+
+        assert result["dry_run"] is True
+
+    def test_d_works_for_rename_only(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {"(1/2/3)": "3", "base name": "trip", "start renaming": "d"})
+
+        assert result is not None
+        assert result["dry_run"] is True
+
+    def test_enter_is_a_real_run(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["dry_run"] is False
+
+
+class TestPresetFlagEdges:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _photos(self, tmp_path):
+        src = tmp_path / "photos"
+        src.mkdir()
+        Image.new("RGB", (1200, 800), (9, 90, 180)).save(src / "a.jpg")
+        return src
+
+    def test_no_strip_overrides_a_stripping_preset(self):
+        args = ic.parse_cli(["x", "--preset", "web", "--no-strip"])
+
+        assert args.strip is False
+
+    def test_no_strip_alone_leaves_the_default(self):
+        assert ic.parse_cli(["x"]).strip is False
+        assert ic.parse_cli(["x", "--strip"]).strip is True
+
+    def test_lossless_drops_the_presets_byte_budget(self):
+        # The user never typed --target-size; the preset's budget must yield
+        # instead of producing an error about a flag nobody gave.
+        args = ic.parse_cli(["x", "--preset", "web", "-f", "webp", "--lossless"])
+
+        assert args.target_size is None
+
+    def test_format_original_drops_the_presets_byte_budget(self):
+        args = ic.parse_cli(["x", "--preset", "web", "-f", "original"])
+
+        assert args.target_size is None
+
+    def test_an_explicit_budget_still_conflicts_with_lossless(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-f", "webp", "--lossless",
+                      "--target-size", "300k")
+
+        assert r.returncode != 0
+        assert "--target-size" in r.stdout + r.stderr
+
+    def test_preset_with_lossless_runs(self, tmp_path):
+        src = self._photos(tmp_path)
+
+        r = self._run(str(src), "--preset", "web", "-f", "webp", "--lossless", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (src / "converted" / "a.webp").exists()
+
+
+# ── Worker must close the source file, not leave it to the garbage collector ─
+
+def _open_fds():
+    return len(os.listdir("/dev/fd"))
+
+
+class TestSourceHandleIsClosed:
+    """
+    A guard, not a bug fix. process_image rebinds `img` inside its `with`
+    block (exif_transpose, convert, resize); that is safe because `with`
+    keeps its own reference to the manager, so __exit__ still closes the
+    opened file. GC is paused so a future change that loses the handle -
+    the draft() work touches exactly this code - shows up as a leak here
+    instead of as "too many open files" on a big batch.
+    """
+
+    @pytest.mark.parametrize("kwargs", [
+        {"max_size": 400},                              # resize path
+        {"max_size": 400, "strip_exif": True},          # exif_transpose path
+        {"format_key": "webp", "max_size": 400},        # convert path
+    ])
+    def test_no_descriptor_survives_the_call(self, tmp_path, kwargs):
+        if not Path("/dev/fd").exists():
+            pytest.skip("needs /dev/fd")
+        src = tmp_path / "src.png"
+        _make_image(src, size=(1200, 900), color=(10, 200, 30, 128), mode="RGBA")
+        fmt = kwargs.pop("format_key", "jpeg")
+        settings = job(fmt, **kwargs)
+
+        gc.collect()
+        gc.disable()
+        try:
+            before = _open_fds()
+            for i in range(15):
+                res = ic.process_image(str(src), str(tmp_path / f"o{i}.{fmt}"), settings)
+                assert res.error is None, res.error
+            after = _open_fds()
+        finally:
+            gc.enable()
+
+        assert after <= before, f"{after - before} file descriptors leaked"
+
+
+# ── draft(): decode large JPEGs at a reduced scale when they get shrunk ──────
+
+def _decoded_sizes(monkeypatch):
+    """Record the pixel size Pillow actually decodes at, calling the real loader."""
+    from PIL import ImageFile
+    seen = []
+    real_load = ImageFile.ImageFile.load
+
+    def spy(self):
+        if self.format == "JPEG" and getattr(self, "tile", None):
+            seen.append(self.size)
+        return real_load(self)
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", spy)
+    return seen
+
+
+def _psnr(a, b):
+    import math
+    from PIL import ImageChops, ImageStat
+    diff = ImageChops.difference(a.convert("RGB"), b.convert("RGB"))
+    mse = sum(v * v for v in ImageStat.Stat(diff).rms) / 3
+    return float("inf") if mse == 0 else 20 * math.log10(255 / math.sqrt(mse))
+
+
+def _photo(path, size=(4000, 3000), exif=None):
+    from PIL import ImageFilter
+    w, h = size
+    # Unblurred noise stands in for fine texture (foliage, fabric): the content
+    # where scaling in the DCT domain alone does visibly worse than LANCZOS.
+    base = Image.linear_gradient("L").resize(size)
+    noise = Image.effect_noise(size, 50)
+    img = Image.merge("RGB", (Image.blend(base, noise, 0.3), base, noise))
+    img.save(path, quality=92, **({"exif": exif} if exif else {}))
+
+
+class TestJpegDraftDecode:
+    def test_large_jpeg_is_decoded_below_full_size(self, tmp_path, monkeypatch):
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        decoded = _decoded_sizes(monkeypatch)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=1000))
+
+        assert res.error is None
+        assert decoded, "the JPEG loader never ran"
+        assert decoded[0][0] < 4000, f"decoded at full size {decoded[0]}"
+
+    def test_decode_keeps_headroom_above_the_target(self, tmp_path, monkeypatch):
+        # Target 450x337. 1/8 (500x375) would cover it, but leaves LANCZOS almost
+        # nothing to work with; the 1.5x gap asks for >= 675x505, which is 1/4.
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        decoded = _decoded_sizes(monkeypatch)
+
+        ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=450))
+
+        assert decoded[0] == (1000, 750), decoded
+
+    def test_no_reduction_when_nothing_is_resized(self, tmp_path, monkeypatch):
+        src = tmp_path / "small.jpg"
+        _photo(src, size=(1600, 1200))
+        decoded = _decoded_sizes(monkeypatch)
+
+        ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", max_size=3000))
+
+        assert decoded[0] == (1600, 1200)
+
+    def test_output_size_and_reported_original_are_exact(self, tmp_path):
+        src = tmp_path / "big.jpg"
+        _photo(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"), job(max_size=1000))
+
+        assert res.original_size == (4000, 3000), "must report the file, not the draft"
+        assert res.new_size == (1000, 750)
+        with Image.open(tmp_path / "o.jpg") as im:
+            assert im.size == (1000, 750)
+
+    @pytest.mark.parametrize("target", [2000, 1600, 1000, 450])
+    def test_quality_matches_a_full_decode(self, tmp_path, target):
+        # 2000 is the hard case: 1/2 lands exactly on the target, so without
+        # headroom the DCT scaling alone would be the whole resample (~38 dB).
+        src = tmp_path / "big.jpg"
+        _photo(src)
+        ic.process_image(str(src), str(tmp_path / "o.webp"),
+                         job("webp", max_size=target, lossless=True))
+        with Image.open(src) as full:
+            reference = full.convert("RGB").resize(
+                ic.calculate_new_size(4000, 3000, target), Image.Resampling.LANCZOS)
+
+        with Image.open(tmp_path / "o.webp") as out:
+            assert _psnr(out, reference) >= 44
+
+    def test_rotated_jpeg_with_strip_keeps_portrait_dimensions(self, tmp_path):
+        exif = Image.Exif()
+        exif[0x0112] = 6                       # rotate 90 CW on display
+        src = tmp_path / "rot.jpg"
+        _photo(src, exif=exif.tobytes())
+
+        res = ic.process_image(str(src), str(tmp_path / "o.jpg"),
+                               job(max_size=1000, strip_exif=True))
+
+        assert res.error is None
+        assert res.original_size == (3000, 4000)
+        with Image.open(tmp_path / "o.jpg") as im:
+            assert im.size == (750, 1000)
+
+
+# ── An output must never be written onto its own source ──────────────────────
+
+class TestOutputNeverOverwritesSource:
+    """Characterisation before the preparation phase loses its resolve() calls."""
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_output_dir_equal_to_input_skips_the_file(self, tmp_path):
+        src = tmp_path / "a.jpg"
+        Image.new("RGB", (900, 700), (5, 6, 7)).save(src)
+        before = src.read_bytes()
+
+        r = self._run(str(tmp_path), "-o", str(tmp_path), "-f", "jpeg", "-m", "400",
+                      "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert src.read_bytes() == before
+
+    def test_output_dir_reached_through_a_symlink_is_recognised(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        src = real / "a.jpg"
+        Image.new("RGB", (900, 700), (5, 6, 7)).save(src)
+        before = src.read_bytes()
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        r = self._run(str(real), "-o", str(link), "-f", "jpeg", "-m", "400", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert src.read_bytes() == before
+
+
+class TestNestedOutputLayout:
+    def test_subfolders_are_mirrored_into_converted(self, tmp_path):
+        for sub in ("x", "y/z"):
+            (tmp_path / sub).mkdir(parents=True)
+            Image.new("RGB", (300, 200)).save(tmp_path / sub / "p.jpg")
+
+        r = subprocess.run([sys.executable, str(REPO_ROOT / "imgcrunch.py"), str(tmp_path),
+                            "-f", "webp", "--no-move"],
+                           input="", capture_output=True, text=True, timeout=120)
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "converted" / "x" / "p.webp").exists()
+        assert (tmp_path / "converted" / "y" / "z" / "p.webp").exists()
+
+
+class TestWorkersFlag:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_limits_the_pool(self, tmp_path):
+        Image.new("RGB", (600, 400)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move", "--workers", "2")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Workers:         2" in r.stdout
+
+    def test_zero_is_rejected(self, tmp_path):
+        r = self._run(str(tmp_path), "--workers", "0")
+
+        assert r.returncode != 0
+        assert "at least 1" in r.stderr, "an unknown-flag error would also mention --workers"
+
+    def test_default_is_one_per_core(self):
+        assert ic.parse_cli(["x"]).workers is None     # resolved to MAX_WORKERS in main()
+
+
+
+# ── Packaging: version, entry point, honest install hints ────────────────────
+
+class TestPackaging:
+    def test_version_flag(self):
+        r = subprocess.run([sys.executable, str(REPO_ROOT / "imgcrunch.py"), "--version"],
+                           capture_output=True, text=True, timeout=60)
+
+        assert r.returncode == 0
+        assert r.stdout.strip() == f"imgcrunch {ic.__version__}"
+
+    def test_cli_entry_point_handles_ctrl_c_before_the_batch(self, monkeypatch, capsys):
+        # The console script calls cli(), not the __main__ block, so the
+        # interrupt fallback has to live there.
+        def interrupted():
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(ic, "main", interrupted)
+
+        with pytest.raises(SystemExit) as exc:
+            ic.cli()
+
+        assert exc.value.code == 0
+        assert "nothing was changed" in capsys.readouterr().out.lower()
+
+    def test_avif_hint_does_not_point_at_pillow_heif(self):
+        # Pillow encodes AVIF itself since 11.3; pillow-heif is for HEIC only.
+        assert "pillow-heif" not in ic.ENCODER_HINTS["avif"]
+        assert "Pillow" in ic.ENCODER_HINTS["avif"]
+
+    def test_heic_and_jxl_hints_name_their_plugins(self):
+        assert "pillow-heif" in ic.ENCODER_HINTS["heic"]
+        assert "pillow-jxl-plugin" in ic.ENCODER_HINTS["jxl"]
+
+
+# ── A worker process that dies must not take the whole batch down ────────────
+
+class _CrashingExecutor:
+    """
+    Runs process_image in-process, except for files named crash*, whose future
+    fails the way a pool does when the OS kills a worker (e.g. out of memory).
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+        from concurrent.futures.process import BrokenProcessPool
+        future = Future()
+        if Path(args[0]).name.startswith("crash"):
+            future.set_exception(BrokenProcessPool(
+                "A process in the process pool was terminated abruptly"))
+        else:
+            future.set_result(fn(*args))
+        return future
+
+    def shutdown(self, *args, **kwargs):
+        pass
+
+
+class TestWorkerCrash:
+    def _batch(self, tmp_path):
+        for name in ("a.jpg", "crash.jpg", "b.jpg"):
+            Image.new("RGB", (900, 700), (7, 8, 9)).save(tmp_path / name)
+
+    def test_crash_is_reported_and_the_rest_still_runs(self, tmp_path, monkeypatch, capsys):
+        self._batch(tmp_path)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp"])
+
+        ic.main()                                   # must not raise
+
+        out = capsys.readouterr().out
+        summary = out.split("Processing Summary")[-1]
+        assert "crash.jpg" in summary
+        assert "worker" in summary.lower()
+        assert (tmp_path / "converted" / "a.webp").exists()
+        assert (tmp_path / "converted" / "b.webp").exists()
+
+    def test_crashed_file_keeps_its_original_in_place(self, tmp_path, monkeypatch, capsys):
+        self._batch(tmp_path)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp"])
+
+        ic.main()
+
+        assert (tmp_path / "crash.jpg").exists(), "no output was made, so nothing may be moved"
+        assert (tmp_path / "originals" / "a.jpg").exists()
+
+    def test_replace_run_cleans_up_its_staging_dir(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "photos"
+        src.mkdir()
+        self._batch(src)
+        monkeypatch.setattr(ic, "ProcessPoolExecutor", _CrashingExecutor)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(src), "-f", "webp",
+                                          "--replace", "--yes"])
+
+        ic.main()
+
+        assert (src / "crash.jpg").exists()
+        assert not list(tmp_path.glob("imgcrunch_tmp_*")), "staging dir left behind"
+
+
+# ── Every output format actually encodes and decodes ─────────────────────────
+
+class TestModernFormats:
+    @pytest.mark.parametrize("fmt, plugin, pil_name, keeps_alpha", [
+        ("avif", None,           "AVIF", True),
+        ("heic", "pillow_heif",  "HEIF", False),
+        ("jxl",  "pillow_jxl",   "JXL",  True),
+    ])
+    def test_round_trip(self, tmp_path, fmt, plugin, pil_name, keeps_alpha):
+        if plugin:
+            pytest.importorskip(plugin)
+        if ic.probe_encoder(fmt):
+            pytest.skip(f"{fmt} not encodable here")
+        src = tmp_path / "src.png"
+        _make_image(src, size=(1600, 1000), color=(20, 120, 220, 128), mode="RGBA")
+        out = tmp_path / f"out{ic.FORMAT_CONFIG[fmt]['extension']}"
+
+        res = ic.process_image(str(src), str(out), job(fmt, quality=70, max_size=800))
+
+        assert res.error is None, res.error
+        with Image.open(out) as im:
+            assert im.format == pil_name
+            assert im.size == (800, 500)
+            assert ("A" in im.getbands()) == keeps_alpha
+
+
+# ── Animated GIFs ────────────────────────────────────────────────────────────
+
+class TestAnimatedGif:
+    def _gif(self, path, size=(200, 100), durations=(40, 90, 150)):
+        frames = []
+        for i, _ in enumerate(durations):
+            f = Image.new("RGB", size, (30, 60, 90))
+            f.paste((250, 20 + 60 * i, 20), (10 + 40 * i, 10, 30 + 40 * i, 30))
+            frames.append(f)
+        frames[0].save(path, save_all=True, append_images=frames[1:],
+                       duration=list(durations), loop=2)
+
+    def test_frames_timing_and_loop_survive_webp(self, tmp_path):
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp"))
+
+        assert res.error is None
+        with Image.open(tmp_path / "o.webp") as im:
+            assert im.n_frames == 3
+            durations = []
+            for i in range(im.n_frames):
+                im.seek(i)
+                im.load()           # WebP fills in a frame's duration on load
+                durations.append(im.info.get("duration"))
+            assert durations == [40, 90, 150]
+            assert im.info.get("loop") == 2
+
+    def test_resize_applies_to_every_frame(self, tmp_path):
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        res = ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", max_size=100))
+
+        assert res.error is None
+        with Image.open(tmp_path / "o.webp") as im:
+            for i in range(im.n_frames):
+                im.seek(i)
+                assert im.size == (100, 50)
+
+    def test_partial_frames_are_not_stretched(self, tmp_path):
+        # GIF encoders store later frames as small patches. If those patches
+        # were resized to the full canvas, the moving square would smear across
+        # the frame; composited correctly it stays a small square.
+        src = tmp_path / "anim.gif"
+        self._gif(src)
+
+        ic.process_image(str(src), str(tmp_path / "o.webp"), job("webp", lossless=True))
+
+        with Image.open(tmp_path / "o.webp") as im:
+            im.seek(2)
+            frame = im.convert("RGB")
+            assert frame.getpixel((100, 20))[0] > 200, "the square should sit at x=90..110"
+            assert frame.getpixel((180, 80))[0] < 60, "the background must not be painted over"
+
+
+# ── Folder modes over the real CLI ───────────────────────────────────────────
+
+class TestFolderModes:
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def test_merge_renames_colliding_names(self, tmp_path):
+        for sub, color in (("x", (200, 0, 0)), ("y", (0, 200, 0))):
+            (tmp_path / sub).mkdir()
+            Image.new("RGB", (300, 200), color).save(tmp_path / sub / "a.jpg")
+
+        r = self._run(str(tmp_path / "x"), str(tmp_path / "y"), "-f", "webp",
+                      "--merge", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        merged = sorted(p.name for p in (tmp_path / "merged_images").iterdir())
+        assert merged == ["a.webp", "a_1.webp"]
+
+    def test_skip_dupes_writes_each_content_once(self, tmp_path):
+        Image.new("RGB", (300, 200), (1, 2, 3)).save(tmp_path / "one.jpg")
+        (tmp_path / "copy.jpg").write_bytes((tmp_path / "one.jpg").read_bytes())
+        Image.new("RGB", (300, 200), (9, 9, 9)).save(tmp_path / "other.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--skip-dupes", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert len(list((tmp_path / "converted").glob("*.webp"))) == 2
+        assert "Dupes skipped" in r.stdout
+
+    def test_originals_move_aside_keeping_their_folders(self, tmp_path):
+        (tmp_path / "trip").mkdir()
+        Image.new("RGB", (300, 200)).save(tmp_path / "trip" / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "originals" / "trip" / "a.jpg").exists()
+        assert (tmp_path / "converted" / "trip" / "a.webp").exists()
+        assert not (tmp_path / "trip" / "a.jpg").exists()
+
+    def test_no_move_leaves_originals_alone(self, tmp_path):
+        Image.new("RGB", (300, 200)).save(tmp_path / "a.jpg")
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move")
+
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (tmp_path / "a.jpg").exists()
+        assert not (tmp_path / "originals").exists()
+
+
+# ── Exit code: a script has to be able to tell that something failed ─────────
+
+class TestExitCode:
+    """
+    The exit code was 0 even when images failed, so a script - especially one
+    using --quiet - had no way to notice short of parsing the output.
+    """
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "imgcrunch.py"), *args],
+            input="", capture_output=True, text=True, timeout=120,
+        )
+
+    def _good(self, path):
+        Image.new("RGB", (600, 400), (3, 4, 5)).save(path / "good.jpg")
+
+    def _bad(self, path):
+        (path / "bad.jpg").write_bytes(b"\xff\xd8\xff" + b"garbage" * 20)
+
+    def test_clean_run_exits_zero(self, tmp_path):
+        self._good(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--no-move").returncode == 0
+
+    def test_a_failed_image_exits_one(self, tmp_path):
+        self._good(tmp_path)
+        self._bad(tmp_path)
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move")
+
+        assert r.returncode == 1
+        assert (tmp_path / "converted" / "good.webp").exists(), "the rest still runs"
+
+    def test_quiet_run_still_exits_one(self, tmp_path):
+        self._bad(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--no-move", "--quiet").returncode == 1
+
+    def test_failing_post_step_exits_one(self, tmp_path):
+        self._good(tmp_path)
+
+        r = self._run(str(tmp_path), "-f", "webp", "--no-move", "--post-hook", "exit 4")
+
+        assert r.returncode == 1
+
+    def test_dry_run_attempts_nothing_so_exits_zero(self, tmp_path):
+        self._bad(tmp_path)
+
+        assert self._run(str(tmp_path), "-f", "webp", "--dry-run").returncode == 0
+
+    def test_warnings_alone_exit_zero(self, tmp_path):
+        _make_image(tmp_path / "logo.png", size=(300, 200), color=(0, 90, 200, 0), mode="RGBA")
+
+        r = self._run(str(tmp_path), "-f", "jpeg", "--no-move")
+
+        assert "transparency" in r.stdout
+        assert r.returncode == 0
+
+    def test_main_returns_the_code_for_cli(self, tmp_path, monkeypatch):
+        self._bad(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["imgcrunch", str(tmp_path), "-f", "webp",
+                                          "--no-move", "--quiet"])
+
+        assert ic.main() == 1

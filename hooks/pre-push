@@ -1,0 +1,22 @@
+#!/bin/bash
+# Run the test suite before every push. A single-developer project needs no CI
+# server for this; a failing suite simply stops the push.
+#
+# Install once:   ln -s ../../hooks/pre-push .git/hooks/pre-push
+# Skip once:      git push --no-verify
+
+set -u
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if [[ -x venv/bin/python ]]; then
+    PYTHON=venv/bin/python
+else
+    PYTHON=python3
+fi
+
+echo "pre-push: running the test suite ($PYTHON -m pytest)…"
+if ! "$PYTHON" -m pytest -q; then
+    echo ""
+    echo "pre-push: tests failed — push stopped. Fix them, or push with --no-verify."
+    exit 1
+fi
