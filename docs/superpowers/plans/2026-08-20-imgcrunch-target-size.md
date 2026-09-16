@@ -1,5 +1,7 @@
 # ImgCrunch: Target-Size, Encoder-Preflight, JobSettings — Implementation Plan
 
+> **Status (2026-09-16): umgesetzt.** Alle sieben Tasks sind auf `main` (Commits `40f792a`…`8a4d6a8`, gemergt in PR #3) und im Code nachgeprüft. Die Checkboxen wurden nachträglich gesetzt; die Zwischenschritte („Test schlägt fehl") sind im Nachhinein nicht mehr einzeln belegbar, die Endergebnisse jedes Tasks schon.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** ImgCrunch bekommt `--target-size`, das jede Ausgabedatei unter eine gewünschte Bytegröße drückt; dazu einen Encoder-Preflight, der fehlende Codecs vor dem ersten Bild erkennt, und eine `JobSettings`-Dataclass, die die Worker-Parameter bündelt und den Byte-Copy-Gate an einer Stelle zusammenführt.
@@ -50,7 +52,7 @@ Reines Verschieben ohne Verhaltensänderung. Danach existiert das Modul, in das 
 **Interfaces:**
 - Produces: `sizing.needs_resize(width: int, height: int, max_size: int) -> bool`, `sizing.calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]`. Beide bleiben zusätzlich als `imgcrunch.needs_resize` / `imgcrunch.calculate_new_size` erreichbar.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Neue Datei `tests/test_sizing.py`:
 
@@ -88,12 +90,12 @@ class TestCalculateNewSize:
         assert h >= 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_sizing.py -v`
 Expected: FAIL mit `ModuleNotFoundError: No module named 'sizing'`
 
-- [ ] **Step 3: Create `sizing.py` with the moved functions**
+- [x] **Step 3: Create `sizing.py` with the moved functions**
 
 ```python
 #!/usr/bin/env python3
@@ -128,7 +130,7 @@ def calculate_new_size(width: int, height: int, target: int) -> tuple[int, int]:
     return new_width, new_height
 ```
 
-- [ ] **Step 4: Remove the originals from `imgcrunch.py` and re-export**
+- [x] **Step 4: Remove the originals from `imgcrunch.py` and re-export**
 
 Lösche `needs_resize` und `calculate_new_size` aus `imgcrunch.py` (Zeilen 335-351) und ergänze bei den Imports (nach `from typing import Optional`, imgcrunch.py:22):
 
@@ -139,12 +141,12 @@ Lösche `needs_resize` und `calculate_new_size` aus `imgcrunch.py` (Zeilen 335-3
 from sizing import calculate_new_size, needs_resize  # noqa: F401
 ```
 
-- [ ] **Step 5: Run the full suite to verify nothing regressed**
+- [x] **Step 5: Run the full suite to verify nothing regressed**
 
 Run: `pytest tests/ -v`
 Expected: PASS — alle bisherigen Tests inklusive `ic.calculate_new_size` und `ic.needs_resize`, plus die sechs neuen aus `tests/test_sizing.py`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add sizing.py tests/test_sizing.py imgcrunch.py
@@ -162,7 +164,7 @@ git commit -m "refactor: extract pure sizing helpers into sizing.py"
 **Interfaces:**
 - Produces: `sizing.search_quality(encode: Callable[[int], bytes], target_bytes: int, lo: int = 1, hi: int = 100) -> Optional[tuple[int, bytes]]` — gibt `(quality, data)` für die höchste Qualität zurück, deren Encode noch unter `target_bytes` liegt, oder `None`, wenn selbst `lo` nicht passt.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 An `tests/test_sizing.py` anhängen:
 
@@ -202,12 +204,12 @@ class TestSearchQuality:
         assert len(calls) <= 7
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_sizing.py::TestSearchQuality -v`
 Expected: FAIL mit `AttributeError: module 'sizing' has no attribute 'search_quality'`
 
-- [ ] **Step 3: Implement `search_quality` in `sizing.py`**
+- [x] **Step 3: Implement `search_quality` in `sizing.py`**
 
 ```python
 def search_quality(
@@ -241,12 +243,12 @@ def search_quality(
     return best
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_sizing.py -v`
 Expected: PASS (10 Tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add sizing.py tests/test_sizing.py
@@ -268,7 +270,7 @@ Das ist der Teil mit den echten Fallstricken: Stagnation bei ganzzahligen Pixelm
 - Produces: `sizing.search_scale(probe: Callable[[int, int], tuple[Optional[bytes], int]], target_bytes: int, width: int, height: int, min_edge: int = 16, max_attempts: int = 16) -> Optional[bytes]`.
   `probe(w, h)` liefert `(fit, floor)`: `fit` sind die Bytes, die bei dieser Pixelgröße unter das Ziel passen (oder `None`), `floor` ist die Bytegröße des kleinstmöglichen Encodes bei dieser Größe. `search_scale` gibt die besten gefundenen Bytes zurück oder `None`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 An `tests/test_sizing.py` anhängen:
 
@@ -348,12 +350,12 @@ class TestSearchScale:
         assert all(w >= 16 and h >= 16 for w, h in calls)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_sizing.py::TestSearchScale -v`
 Expected: FAIL mit `AttributeError: module 'sizing' has no attribute 'search_scale'`
 
-- [ ] **Step 3: Implement `search_scale` in `sizing.py`**
+- [x] **Step 3: Implement `search_scale` in `sizing.py`**
 
 ```python
 def search_scale(
@@ -429,12 +431,12 @@ def search_scale(
     return best
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_sizing.py -v`
 Expected: PASS (16 Tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add sizing.py tests/test_sizing.py
@@ -452,7 +454,7 @@ git commit -m "feat: add dimension search for unreachable target sizes"
 **Interfaces:**
 - Produces: `imgcrunch.JobSettings(format_key: str, quality: int, max_size: int, lossless: bool = False, strip_exif: bool = False, target_bytes: Optional[int] = None)` mit `forces_reencode() -> bool`. Neue Worker-Signatur: `process_image(input_path_str: str, output_path_str: str, settings: JobSettings, input_bytes: int = 0) -> ProcessResult`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Neue Datei `tests/test_settings.py`:
 
@@ -498,12 +500,12 @@ class TestPicklable:
         assert pickle.loads(pickle.dumps(settings)) == settings
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_settings.py -v`
 Expected: FAIL mit `AttributeError: module 'imgcrunch' has no attribute 'JobSettings'`
 
-- [ ] **Step 3: Add the dataclass to `imgcrunch.py`**
+- [x] **Step 3: Add the dataclass to `imgcrunch.py`**
 
 Direkt vor `@dataclass class ProcessResult` (imgcrunch.py:111) einfügen:
 
@@ -536,12 +538,12 @@ class JobSettings:
         return bool(self.lossless or self.strip_exif or self.target_bytes)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_settings.py -v`
 Expected: PASS (6 Tests)
 
-- [ ] **Step 5: Change the `process_image` signature**
+- [x] **Step 5: Change the `process_image` signature**
 
 Ersetze den Kopf (imgcrunch.py:353-361) durch:
 
@@ -569,7 +571,7 @@ def process_image(
 
 Die lokalen Aliase halten den restlichen Funktionsrumpf unverändert — das ist Absicht, damit dieser Task keine Verhaltensänderung enthält und der Diff prüfbar bleibt.
 
-- [ ] **Step 6: Route the byte-copy gate through `forces_reencode()`**
+- [x] **Step 6: Route the byte-copy gate through `forces_reencode()`**
 
 Ersetze die Early-Bail-Out-Bedingung (imgcrunch.py:441-443) durch:
 
@@ -584,7 +586,7 @@ Ersetze die Early-Bail-Out-Bedingung (imgcrunch.py:441-443) durch:
 
 `lossless` und `strip_exif` verschwinden hier aus der Bedingung — sie stecken jetzt in `forces_reencode()`.
 
-- [ ] **Step 7: Update the executor call site**
+- [x] **Step 7: Update the executor call site**
 
 Ersetze imgcrunch.py:1443-1448:
 
@@ -608,7 +610,7 @@ Ersetze imgcrunch.py:1443-1448:
 
 `job_settings` wird vor der `for`-Schleife gebaut, aber innerhalb des `with ProcessPoolExecutor(...)`-Blocks.
 
-- [ ] **Step 8: Update the ten `process_image` calls in the existing tests**
+- [x] **Step 8: Update the ten `process_image` calls in the existing tests**
 
 In `tests/test_imgcrunch.py` einen Helfer oben im Modul ergänzen (nach dem `import imgcrunch as ic`):
 
@@ -634,12 +636,12 @@ res = ic.process_image(str(src), str(out), job(strip_exif=True))
 
 Betroffen sind die Zeilen 126, 136, 145, 154, 166, 181, 196 sowie alle weiteren Treffer von `ic.process_image` — vor dem Umschreiben mit `grep -n "ic.process_image" tests/test_imgcrunch.py` die vollständige Liste holen, damit keiner übersehen wird.
 
-- [ ] **Step 9: Run the full suite**
+- [x] **Step 9: Run the full suite**
 
 Run: `pytest tests/ -v`
 Expected: PASS — alle bestehenden Tests plus `tests/test_settings.py` und `tests/test_sizing.py`.
 
-- [ ] **Step 10: Verify the real pipeline still runs end to end**
+- [x] **Step 10: Verify the real pipeline still runs end to end**
 
 Run:
 ```bash
@@ -651,7 +653,7 @@ Image.new('RGB', (800, 600), (10, 200, 90)).save('/tmp/ic-check/b.png')
 ```
 Expected: beide Bilder landen in `/tmp/ic-check/converted/`, die Zusammenfassung meldet 2 verarbeitete Bilder und 0 Fehler.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add imgcrunch.py tests/test_imgcrunch.py tests/test_settings.py
@@ -669,7 +671,7 @@ git commit -m "refactor: bundle worker parameters into JobSettings"
 **Interfaces:**
 - Produces: `imgcrunch.probe_encoder(format_key: str) -> Optional[str]` — gibt `None` zurück, wenn das Format encodierbar ist, sonst einen fertigen, mehrzeiligen Installationshinweis.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 An `tests/test_imgcrunch.py` anhängen:
 
@@ -697,12 +699,12 @@ class TestProbeEncoder:
         assert "pip install" in hint
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_imgcrunch.py::TestProbeEncoder -v`
 Expected: FAIL mit `AttributeError: module 'imgcrunch' has no attribute 'probe_encoder'`
 
-- [ ] **Step 3: Implement `probe_encoder`**
+- [x] **Step 3: Implement `probe_encoder`**
 
 `import io` zu den Imports oben in `imgcrunch.py` ergänzen (alphabetisch nach `import hashlib`), dann die Funktion nach `format_bytes` (imgcrunch.py:150) einfügen:
 
@@ -745,12 +747,12 @@ def probe_encoder(format_key: str) -> Optional[str]:
     return None
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_imgcrunch.py::TestProbeEncoder -v`
 Expected: PASS (4 Tests)
 
-- [ ] **Step 5: Replace the import-only checks in `main()`**
+- [x] **Step 5: Replace the import-only checks in `main()`**
 
 Ersetze imgcrunch.py:1162-1168 (den `HEIF_AVAILABLE` / `JXL_AVAILABLE`-Block) durch:
 
@@ -762,12 +764,12 @@ Ersetze imgcrunch.py:1162-1168 (den `HEIF_AVAILABLE` / `JXL_AVAILABLE`-Block) du
         sys.exit(1)
 ```
 
-- [ ] **Step 6: Verify the preflight fires**
+- [x] **Step 6: Verify the preflight fires**
 
 Run: `python3 imgcrunch.py /tmp/ic-check -f jxl --dry-run`
 Expected: entweder ein sauberer Dry-Run (JXL-Encoder vorhanden) oder ein einzeiliger Fehler mit `pip install pillow-jxl-plugin` und Exit-Code 1 — in keinem Fall ein Traceback. Exit-Code prüfen mit `echo $?`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add imgcrunch.py tests/test_imgcrunch.py
@@ -786,7 +788,7 @@ git commit -m "feat: probe the real encoder before starting a batch"
 - Consumes: `sizing.search_quality`, `sizing.search_scale`, `imgcrunch.JobSettings.target_bytes`.
 - Produces: `sizing.parse_size(text: str) -> int` — wandelt `"500k"`, `"1.5m"`, `"800kb"`, `"250000"` in Bytes; wirft `ValueError` bei Unsinn.
 
-- [ ] **Step 1: Write the failing test for the parser**
+- [x] **Step 1: Write the failing test for the parser**
 
 An `tests/test_sizing.py` anhängen:
 
@@ -819,12 +821,12 @@ class TestParseSize:
             sizing.parse_size("big")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_sizing.py::TestParseSize -v`
 Expected: FAIL mit `AttributeError: module 'sizing' has no attribute 'parse_size'`
 
-- [ ] **Step 3: Implement `parse_size` in `sizing.py`**
+- [x] **Step 3: Implement `parse_size` in `sizing.py`**
 
 ```python
 _SIZE_UNITS = {'': 1, 'b': 1, 'k': 1024, 'kb': 1024,
@@ -856,12 +858,12 @@ def parse_size(text: str) -> int:
     return size
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_sizing.py -v`
 Expected: PASS (23 Tests)
 
-- [ ] **Step 5: Add the CLI flag and its validation**
+- [x] **Step 5: Add the CLI flag and its validation**
 
 Nach `--lossless` (imgcrunch.py:1134) einfügen:
 
@@ -901,7 +903,7 @@ Nach dem `--rename-only`-Validierungsblock (imgcrunch.py:1188) einfügen:
 
 Dazu oben bei den Imports `import sizing` ergänzen (die bestehende `from sizing import ...`-Zeile bleibt, beide nebeneinander sind hier korrekt, weil der Code jetzt beides braucht).
 
-- [ ] **Step 6: Pass it into `JobSettings`**
+- [x] **Step 6: Pass it into `JobSettings`**
 
 In der Aufrufstelle aus Task 4 ergänzen:
 
@@ -916,7 +918,7 @@ In der Aufrufstelle aus Task 4 ergänzen:
         )
 ```
 
-- [ ] **Step 7: Write the failing end-to-end test**
+- [x] **Step 7: Write the failing end-to-end test**
 
 An `tests/test_imgcrunch.py` anhängen:
 
@@ -969,12 +971,12 @@ class TestTargetSize:
             assert img.size == (800, 600)
 ```
 
-- [ ] **Step 8: Run test to verify it fails**
+- [x] **Step 8: Run test to verify it fails**
 
 Run: `pytest tests/test_imgcrunch.py::TestTargetSize -v`
 Expected: FAIL — `test_output_lands_under_the_target` schlägt fehl, weil die Datei noch mit Qualität 95 geschrieben wird und über 40 KB liegt.
 
-- [ ] **Step 9: Implement the target-size path in the worker**
+- [x] **Step 9: Implement the target-size path in the worker**
 
 Im statischen Zweig von `process_image`, direkt vor dem `# Build save kwargs`-Block (imgcrunch.py:551), einfügen:
 
@@ -1028,12 +1030,12 @@ Im statischen Zweig von `process_image`, direkt vor dem `# Build save kwargs`-Bl
 
 `import sizing` muss dafür oben im Modul stehen (in Task 6, Step 5 bereits ergänzt). Der Pfad kehrt bewusst früh zurück: die normale `img.save`-Strecke darunter würde die gefundenen Bytes sonst erneut encodieren.
 
-- [ ] **Step 10: Run the tests**
+- [x] **Step 10: Run the tests**
 
 Run: `pytest tests/ -v`
 Expected: PASS — alle Tests inklusive der drei neuen aus `TestTargetSize`.
 
-- [ ] **Step 11: Verify on the CLI**
+- [x] **Step 11: Verify on the CLI**
 
 Run:
 ```bash
@@ -1042,7 +1044,7 @@ ls -l /tmp/ic-out
 ```
 Expected: jede Ausgabedatei ist 60 KB oder kleiner; die Zusammenfassung meldet 0 Fehler.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add sizing.py imgcrunch.py tests/test_sizing.py tests/test_imgcrunch.py
@@ -1059,7 +1061,7 @@ git commit -m "feat: add --target-size to crunch outputs below a byte budget"
 **Interfaces:**
 - Consumes: die fertige `--target-size`-Flag aus Task 6 und den Preflight aus Task 5.
 
-- [ ] **Step 1: Document `--target-size` under Core Features**
+- [x] **Step 1: Document `--target-size` under Core Features**
 
 Im Abschnitt „📦 Multi-Format Power" nach der `Smart Quality`-Zeile einfügen:
 
@@ -1067,7 +1069,7 @@ Im Abschnitt „📦 Multi-Format Power" nach der `Smart Quality`-Zeile einfüge
 - **Target Size (`--target-size`)**: Force every output below a byte budget (`500k`, `1.5m`). Quality is lowered first; if that isn't enough, the image is scaled down until it fits. Files that can't reach the target are reported as errors instead of being written oversized.
 ```
 
-- [ ] **Step 2: Document the preflight under Privacy & Safety**
+- [x] **Step 2: Document the preflight under Privacy & Safety**
 
 Nach der `Preflight Disk Check`-Zeile einfügen:
 
@@ -1075,7 +1077,7 @@ Nach der `Preflight Disk Check`-Zeile einfügen:
 - **Encoder Preflight**: Verifies the output format can actually be encoded on this machine before the batch starts — a missing AVIF or JXL encoder fails immediately with an install hint instead of on image 200.
 ```
 
-- [ ] **Step 3: Add a usage example**
+- [x] **Step 3: Add a usage example**
 
 Im Abschnitt mit den Kommandozeilenbeispielen ergänzen:
 
@@ -1084,12 +1086,12 @@ imgcrunch ~/Pictures --target-size 500k        # every output under 500 KB
 imgcrunch ~/Pictures -f webp --target-size 200k -m 2000
 ```
 
-- [ ] **Step 4: Verify the documented behaviour matches reality**
+- [x] **Step 4: Verify the documented behaviour matches reality**
 
 Run: `python3 imgcrunch.py --help | grep -A2 target-size`
 Expected: der Hilfetext stimmt mit der README-Beschreibung überein.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md
@@ -1100,6 +1102,6 @@ git commit -m "docs: document --target-size and the encoder preflight"
 
 ## Offene Punkte für später
 
-- **Presets.** Im Brainstorming bewusst gestrichen: Plattform-Presets brauchen Center-Crop, und blinder Mittenbeschnitt ohne Vorschau beschädigt Batch-Ergebnisse. Falls das Thema wiederkommt, wäre die tragfähige Variante keine Plattform-Liste, sondern „Crunch-Profile" (Format + Qualität + `--max-size` + `--target-size` unter einem Namen) — kein Beschnitt, kein neues Bildmodell.
+- **Presets.** *Nachtrag 2026-09-16: umgesetzt in genau der hier empfohlenen Form* — `presets.py` bündelt Format, Qualität, `--max-size`, `--target-size` und EXIF unter einem Namen (`web`, `archive`, `compact`, `last`), ohne Beschnitt. Ursprüngliche Notiz: Im Brainstorming bewusst gestrichen: Plattform-Presets brauchen Center-Crop, und blinder Mittenbeschnitt ohne Vorschau beschädigt Batch-Ergebnisse. Falls das Thema wiederkommt, wäre die tragfähige Variante keine Plattform-Liste, sondern „Crunch-Profile" (Format + Qualität + `--max-size` + `--target-size` unter einem Namen) — kein Beschnitt, kein neues Bildmodell.
 - **Fit-Modus** (in eine W×H-Box skalieren, Seitenverhältnis erhalten). Fiel mit den Presets weg, weil `--max-size` den Bedarf abdeckt. Wäre eine reine Ergänzung in `sizing.py`, falls jemand danach fragt.
 - **Animierte GIFs und `--target-size`.** Der Target-Size-Pfad sitzt bewusst nur im statischen Zweig von `process_image`. Ein animiertes GIF nach WebP/AVIF wird bei gesetztem `--target-size` also mit der normalen Qualität geschrieben und kann das Budget überschreiten. Eine Suche über alle Frames wäre um den Faktor Framezahl teurer; falls das je gebraucht wird, gehört es in einen eigenen Task mit eigener Entscheidung, ob die Frames einzeln oder gemeinsam skaliert werden.
