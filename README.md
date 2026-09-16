@@ -210,6 +210,11 @@ input-folder/
 - **The Quick Action survives moving the clone** when imgcrunch is installed with pipx, and explains itself instead of failing silently when it is not. Its temp file moved out of the shared `/tmp`, and installing it no longer resets the system-wide LaunchServices database (`lsregister -kill`); it refreshes only the Services menu.
 - **`resize.sh` explains a missing venv** instead of printing a bare shell error.
 
+**Robustness and tests**
+
+- **A worker process that dies no longer takes the batch down.** If the OS kills one — usually for memory — its images are reported as failed with a hint to lower `--workers`, originals stay put, and everything else still finishes and is summarised.
+- **The suite covers what it used to skip:** HEIC, AVIF and JPEG XL round trips, animated GIF frames, timing and loop count, `--merge`, `--skip-dupes`, moving originals, the Quick Action installer and launcher, and a worker crash. 97 tests at v1.0.0, 227 now.
+
 **Performance**
 
 - **Large JPEGs are decoded at a reduced scale when they are about to be shrunk.** libjpeg can scale by ½, ¼ or ⅛ while decoding; the decode keeps 1.5× headroom above the target so LANCZOS still does the final step (≥ 44 dB PSNR against a full decode, even on fine texture). On 60 × 12 MP photos: `-m 800` 0.84 s → 0.63 s, `-m 1200` 1.23 s → 1.02 s. Mild shrinks, including the default `-m 3000` on typical camera files, are unchanged.
@@ -254,6 +259,24 @@ input-folder/
 - **WebP Encoding Optimization** – Adjusted libwebp compression method from level 6 to level 4 for up to 100x faster animated WebP rendering.
 - **Terminal Progress Updates** – Dynamically displays the current progress percentage in the terminal title bar.
 - **Bugfixes** – Fixed argument scanning errors for single file inputs, resolved wizard detection fallback markers, and defaulted GIFs to WebP conversion.
+
+---
+
+## 🧪 Development
+
+```bash
+python3 -m venv venv
+./venv/bin/pip install -r requirements-dev.txt   # project + all extras + pytest
+./venv/bin/python -m pytest
+```
+
+The suite never touches your real `~/.config/imgcrunch` or `~/Library`: config lookups are redirected to a temp directory, and the Quick Action tests install into temp directories with `osascript` stubbed out. HEIC and JPEG XL tests skip when their plugin is missing.
+
+To run the tests before every push:
+```bash
+ln -s ../../hooks/pre-push .git/hooks/pre-push
+```
+Skip it for a single push with `git push --no-verify`; remove it by deleting `.git/hooks/pre-push`.
 
 ---
 
