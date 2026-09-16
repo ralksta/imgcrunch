@@ -503,9 +503,12 @@ def process_image(
             # True dimensions of the file, as displayed. Everything below sizes
             # its decisions on these - never on img.size, which draft() shrinks.
             width, height = img.size
-            will_transpose = strip_exif and not is_animated_gif
-            quarter_turn = (will_transpose
-                            and img.getexif().get(0x0112, 1) in (5, 6, 7, 8))
+            orientation = (img.getexif().get(0x0112, 1)
+                           if strip_exif and not is_animated_gif else 1)
+            # exif_transpose returns a full copy of the image even when the
+            # orientation is already upright, so only call it when it turns.
+            will_transpose = orientation in (2, 3, 4, 5, 6, 7, 8)
+            quarter_turn = orientation in (5, 6, 7, 8)
             if quarter_turn:
                 width, height = height, width
             result.original_size = (width, height)
