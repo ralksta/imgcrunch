@@ -959,6 +959,32 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  Format: ORIGINAL (copy-only){C.RESET}")
     print()
 
+    # Lossless and quality - only on the guided path, where no preset decided
+    # them. Lossless comes first because it makes the quality moot.
+    guided = format_key != 'original' and not rename_only and not preset_used
+    if guided and format_key in ('webp', 'avif'):
+        answer = input(f"  Lossless? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+        lossless = answer in ('y', 'yes')
+        if lossless:
+            print(f"  {C.GREEN}\u2705  Lossless {format_key.upper()} \u2014 larger files, "
+                  f"no quality loss{C.RESET}")
+        print()
+    if guided and not lossless:
+        print(f"  {C.BOLD}Which quality?{C.RESET}")
+        print(f"  {C.DIM}Lower means smaller files. Enter keeps the tuned default "
+              f"for {format_key.upper()}.{C.RESET}")
+        print()
+        while True:
+            raw = input(f"  Quality (1-100) [{C.CYAN}{default_quality}{C.RESET}]: ").strip()
+            if not raw:
+                break
+            if raw.isdigit() and 1 <= int(raw) <= 100:
+                default_quality = int(raw)
+                break
+            print(f"  {C.YELLOW}\u26a0\ufe0f  Please enter a whole number from 1 to 100.{C.RESET}")
+        print(f"  {C.GREEN}\u2705  Quality: {default_quality}{C.RESET}")
+        print()
+
     # 5. Max longest side (if not copy-only)
     if max_px is None:
         print(f"  {C.BOLD}What should the max longest side be (in pixels)?{C.RESET}")
@@ -992,7 +1018,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     # A byte budget needs something to trade away, so it is only offered when
     # a real output format was chosen. That also makes the CLI's --target-size
     # conflicts (--format original, --lossless) unreachable from here.
-    if format_key != 'original' and not rename_only and not preset_used:
+    if format_key != 'original' and not rename_only and not preset_used and not lossless:
         print(f"  {C.BOLD}What should the max file size per image be?{C.RESET}")
         print(f"  {C.DIM}Quality is lowered first, then dimensions if needed.{C.RESET}")
         print(f"  {C.DIM}e.g. 500k, 1.5m  (press Enter for no limit){C.RESET}")
@@ -1073,6 +1099,18 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             print(f"  {C.GREEN}✅  EXIF metadata will be preserved{C.RESET}")
         print()
 
+    # 9. Duplicates - guided path only; presets stay a one-key choice.
+    skip_dupes = False
+    if guided:
+        print(f"  {C.BOLD}Skip files that are exact duplicates of another image?{C.RESET}")
+        print(f"  {C.DIM}Compares file contents, not names. Costs a hashing pass first.{C.RESET}")
+        print()
+        answer = input(f"  Skip duplicates? (y/{C.GREEN}N{C.RESET}): ").strip().lower()
+        skip_dupes = answer in ('y', 'yes')
+        if skip_dupes:
+            print(f"  {C.GREEN}\u2705  Duplicates will be skipped{C.RESET}")
+        print()
+
     # Confirmation
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
     if rename_only:
@@ -1086,8 +1124,10 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         print()
         print(f"  {C.YELLOW}⚠️  The original filenames cannot be restored afterwards.{C.RESET}")
         print()
-        confirm = input(f"  Start renaming? ({C.GREEN}Y{C.RESET}/n): ").strip().lower()
-        if confirm and confirm not in ('y', 'yes'):
+        confirm = input(f"  Start renaming? ({C.GREEN}Y{C.RESET}/n"
+                        f"{C.DIM} \u00b7 d = dry run{C.RESET}): ").strip().lower()
+        dry_run = confirm in ('d', 'dry', 'dry run')
+        if confirm and not dry_run and confirm not in ('y', 'yes'):
             print()
             print(f"  {C.DIM}No worries — nothing was changed. 👋{C.RESET}")
             print()
@@ -1108,6 +1148,7 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
             'post_hook':     None,
             'merge':         False,
             'strip':         False,
+            'dry_run':       dry_run,
             'yes':           True,
             'quiet':         False,
         }
@@ -1121,8 +1162,12 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         if lossless:
             print(f"  {C.BOLD}Quality:{C.RESET}      lossless")
         else:
-            origin = ("from preset" if preset_used
-                      else f"smart default for {format_key.upper()}")
+            if preset_used:
+                origin = "from preset"
+            elif default_quality == FORMAT_QUALITY_DEFAULTS[format_key]:
+                origin = f"smart default for {format_key.upper()}"
+            else:
+                origin = "chosen"
             print(f"  {C.BOLD}Quality:{C.RESET}      {default_quality}  {C.DIM}({origin}){C.RESET}")
     print(f"  {C.BOLD}Max size:{C.RESET}     {'no resizing' if max_px == 0 else f'{max_px}px'}")
     if target_bytes:
@@ -1134,6 +1179,8 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     if not replace_mode:
         print(f"  {C.BOLD}Rename:{C.RESET}       {rename_base + '_###' if rename_base else C.DIM + 'keep originals' + C.RESET}")
     print(f"  {C.BOLD}Privacy:{C.RESET}      {'⚠️  Strip metadata' if strip_mode else 'Keep EXIF metadata'}")
+    if skip_dupes:
+        print(f"  {C.BOLD}Duplicates:{C.RESET}   skipped")
     print(f"  {C.BOLD}Images:{C.RESET}       {len(scanned_images)}")
     print(f"{C.DIM}{'─' * 44}{C.RESET}")
 
@@ -1144,13 +1191,19 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
     print()
     # Replace has no undo, so Enter must not be the button that triggers it.
     # Every other mode keeps its friendly default.
+    # A dry run writes nothing, so it is safe to offer as a one-letter answer
+    # on every path - including replace, where it is the most useful.
+    hint = f"{C.DIM} \u00b7 d = dry run{C.RESET}"
     if replace_mode:
-        prompt  = f"  Start processing? (y/{C.GREEN}N{C.RESET}): "
-        started = input(prompt).strip().lower() in ('y', 'yes')
+        prompt = f"  Start processing? (y/{C.GREEN}N{C.RESET}{hint}): "
     else:
-        prompt  = f"  Start processing? ({C.GREEN}Y{C.RESET}/n): "
-        confirm = input(prompt).strip().lower()
-        started = not confirm or confirm in ('y', 'yes')
+        prompt = f"  Start processing? ({C.GREEN}Y{C.RESET}/n{hint}): "
+    confirm = input(prompt).strip().lower()
+    dry_run = confirm in ('d', 'dry', 'dry run')
+    if replace_mode:
+        started = dry_run or confirm in ('y', 'yes')
+    else:
+        started = dry_run or not confirm or confirm in ('y', 'yes')
     if not started:
         print()
         print(f"  {C.DIM}No worries — nothing was changed.{C.RESET}")
@@ -1170,10 +1223,11 @@ def startup_wizard(prefills: Optional[list[str]] = None) -> Optional[dict]:
         'replace':       replace_mode,
         'target_size':   target_bytes,
         'lossless':      lossless,
-        'skip_dupes':    False,
+        'skip_dupes':    skip_dupes,
         'post_hook':     None,
         'merge':         merge_mode,
         'strip':         strip_mode,
+        'dry_run':       dry_run,
         'yes':           True,
         'quiet':         False,
     }

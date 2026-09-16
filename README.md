@@ -184,6 +184,7 @@ input-folder/
 
 - **Presets.** The wizard opens with *Last run*, *Web*, *Archive* and *Save space*; picking one answers the format, quality, size, byte-budget and metadata questions in one keystroke. The same recipes are available as `--preset NAME`, with explicitly typed flags taking precedence. Presets never carry a mode, so one can never switch on `--replace`.
 - **Transparency is no longer flattened in silence.** A folder of PNGs used to default to JPEG, painting every transparent pixel white. PNG now suggests WebP, and flattening real transparency into JPEG or HEIC produces a warning.
+- **Every option is reachable from the wizard.** *Choose each setting* now asks for quality, offers lossless for WebP and AVIF (skipping quality and byte budget, which it makes meaningless), and can skip duplicates. Answering `d` at the final prompt does a dry run on any path — presets and replace included.
 - **Same default everywhere.** Enter on the longest-side question now means 3000px, like the command line and this README; `0` still disables resizing.
 - **Vanished Finder selections are named** instead of silently shrinking the input list.
 

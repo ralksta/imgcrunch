@@ -1418,7 +1418,8 @@ class TestPresetFormatsMatchTheEncoder:
 # ── Presets in the wizard ────────────────────────────────────────────────────
 
 class TestWizardPresets:
-    ENCODING_PROMPTS = ("1/2/3/4/5", "max longest side", "max file size", "strip metadata")
+    ENCODING_PROMPTS = ("1/2/3/4/5", "quality (1-100)", "max longest side",
+                        "max file size", "strip metadata")
 
     def _asked(self, seen, needle):
         return any(needle in p for p in seen)
@@ -1578,3 +1579,77 @@ class TestPresetFlag:
         # "web" would also match "webp" in the usage line; "archive" appears
         # nowhere but in the list of valid preset names.
         assert "archive" in r.stderr, "the error should list the valid names"
+
+
+# ── The guided path can reach every encoding option ──────────────────────────
+
+class TestWizardGuidedPathOptions:
+    # Without a remembered run the menu is Web, Archive, Save space, then custom.
+    CUSTOM = {"preset": "4"}
+
+    def test_quality_can_be_chosen(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {**self.CUSTOM, "quality (1-100)": "70"})
+
+        assert result["quality"] == 70
+
+    def test_enter_keeps_the_format_default_quality(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, self.CUSTOM)
+
+        assert result["quality"] == ic.FORMAT_QUALITY_DEFAULTS[result["format"]]
+
+    def test_out_of_range_quality_is_asked_again(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "quality (1-100)": ["150", "60"]})
+
+        assert result["quality"] == 60
+        assert len([p for p in seen if "quality (1-100)" in p]) == 2
+
+    def test_lossless_webp_skips_quality_and_budget(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "1/2/3/4/5": "4", "lossless?": "y"})
+
+        assert result["format"] == "webp"
+        assert result["lossless"] is True
+        assert not any("quality (1-100)" in p for p in seen)
+        assert not any("max file size" in p for p in seen), \
+            "--target-size cannot combine with --lossless"
+
+    def test_lossless_is_not_offered_for_jpeg(self, monkeypatch, wizard_dir):
+        result, seen = _drive_wizard(monkeypatch, wizard_dir,
+                                     {**self.CUSTOM, "1/2/3/4/5": "1"})
+
+        assert not any("lossless?" in p for p in seen)
+        assert result["lossless"] is False
+
+    def test_duplicates_can_be_skipped(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {**self.CUSTOM, "duplicates?": "y"})
+
+        assert result["skip_dupes"] is True
+
+
+class TestWizardDryRunFromConfirmation:
+    def test_d_at_the_confirmation_means_dry_run(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir, {"start processing": "d"})
+
+        assert result is not None
+        assert result["dry_run"] is True
+
+    def test_d_works_after_a_preset_too(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {"preset": "1", "start processing": "d"})
+
+        assert result["dry_run"] is True
+
+    def test_d_works_for_rename_only(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir,
+                                  {"(1/2/3)": "3", "base name": "trip", "start renaming": "d"})
+
+        assert result is not None
+        assert result["dry_run"] is True
+
+    def test_enter_is_a_real_run(self, monkeypatch, wizard_dir):
+        result, _ = _drive_wizard(monkeypatch, wizard_dir)
+
+        assert result["dry_run"] is False
