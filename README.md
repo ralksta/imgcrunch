@@ -182,6 +182,13 @@ input-folder/
 ### Unreleased
 *Everything below has landed on `main` since the v1.0.0 tag.*
 
+**Performance**
+
+- **Large JPEGs are decoded at a reduced scale when they are about to be shrunk.** libjpeg can scale by ½, ¼ or ⅛ while decoding; the decode keeps 1.5× headroom above the target so LANCZOS still does the final step (≥ 44 dB PSNR against a full decode, even on fine texture). On 60 × 12 MP photos: `-m 800` 0.84 s → 0.63 s, `-m 1200` 1.23 s → 1.02 s. Mild shrinks, including the default `-m 3000` on typical camera files, are unchanged.
+- **Preparation no longer resolves every path five times.** Before the progress bar appears on 10,000 files: 1.04 s → 0.28 s.
+- **`--strip` no longer copies upright images** just to not rotate them: 45 MB less peak memory per worker on a 12 MP photo.
+- **`--workers N`** caps the encoder pool. On a 10 performance + 4 efficiency core Mac, 10 workers cost about 4 % against the default.
+
 **Wizard**
 
 - **Presets.** The wizard opens with *Last run*, *Web*, *Archive* and *Save space*; picking one answers the format, quality, size, byte-budget and metadata questions in one keystroke. The same recipes are available as `--preset NAME`, with explicitly typed flags taking precedence. Presets never carry a mode, so one can never switch on `--replace`.
